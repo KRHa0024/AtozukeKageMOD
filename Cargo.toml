@@ -2,9 +2,13 @@
 name = "atozuke-kage-mod"
 version = "0.1.0"
 edition = "2021"
-description = "Atozuke Kage MOD: add AI shading to an image as a separate shadow layer (UI prototype)"
+description = "Atozuke Kage MOD: add AI shading to an image as a separate shadow layer"
 license = "MIT"
 publish = false
+
+[lib]
+name = "kage"
+path = "src/lib.rs"
 
 [[bin]]
 name = "AtozukeKageMOD"
@@ -15,6 +19,15 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 egui-phosphor = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+ureq = { version = "2.12", default-features = false, features = ["json"] }
+webp = { version = "0.3", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [profile.release]
 opt-level = 3

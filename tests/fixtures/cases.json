@@ -1,0 +1,67 @@
+{
+  "color_mask": {
+    "kwargs": {
+      "color": true,
+      "smooth": 0.0
+    },
+    "mask": true,
+    "same_size": false,
+    "mean_darkening": 0.0796,
+    "brightened_fraction": 0.0072,
+    "reconstruction_error": 22.81,
+    "solve_size": [
+      192,
+      288
+    ],
+    "smooth_radius_px": 1
+  },
+  "gray_nomask": {
+    "kwargs": {
+      "color": false,
+      "smooth": 0.0
+    },
+    "mask": false,
+    "same_size": false,
+    "mean_darkening": 0.1687,
+    "brightened_fraction": 0.0065,
+    "reconstruction_error": 5.4,
+    "solve_size": [
+      192,
+      288
+    ],
+    "smooth_radius_px": 1
+  },
+  "color_smooth_strong": {
+    "kwargs": {
+      "color": true,
+      "smooth": 1.0,
+      "strength": 1.3
+    },
+    "mask": true,
+    "same_size": false,
+    "mean_darkening": 0.1029,
+    "brightened_fraction": 0.0083,
+    "reconstruction_error": 24.84,
+    "solve_size": [
+      192,
+      288
+    ],
+    "smooth_radius_px": 2
+  },
+  "color_samesize": {
+    "kwargs": {
+      "color": true,
+      "smooth": 0.0
+    },
+    "mask": true,
+    "same_size": true,
+    "mean_darkening": 0.0789,
+    "brightened_fraction": 0.0099,
+    "reconstruction_error": 22.77,
+    "solve_size": [
+      320,
+      480
+    ],
+    "smooth_radius_px": 1
+  }
+}

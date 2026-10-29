@@ -1,10 +1,15 @@
-//! Atozuke Kage MOD — UI prototype (egui). No backend yet: generation is simulated, the shading preview is a
-//! uniform darkening of the opened image.
+//! Atozuke Kage MOD — adds AI shading to an image as a separate shadow layer (egui front end).
+//!
+//! The work happens in the `kage` library: a private ComfyUI instance draws the shading (Qwen-Image 2.1), BiRefNet
+//! finds the subject, and the shadow layer is solved locally.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod i18n;
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -13,6 +18,15 @@ use eframe::egui::{
 };
 use egui_phosphor::regular as ph;
 use i18n::{t, Lang, T};
+use kage::blend::{self, MODES};
+use kage::comfy::{self, Comfy};
+use kage::config::{self, Config};
+use kage::export::{self, Format, Pixels, PsdLayer, FORMATS};
+use kage::log::{Level, Log};
+use kage::models::{self, Status, Verifier, MODELS};
+use kage::pipeline::{self, Event, Params, Request, RunResult};
+use kage::resample::{self, Filter};
+use kage::shading::{Image8, Layers};
 
 const BLUE: Color32 = Color32::from_rgb(0x00, 0x53, 0x7d);
 const SEL: Color32 = Color32::from_rgb(0xbf, 0xe3, 0xff);
@@ -27,11 +41,12 @@ const GREEN: Color32 = Color32::from_rgb(0x2e, 0x8b, 0x57);
 const AMBER: Color32 = Color32::from_rgb(0x8a, 0x5a, 0x08);
 const RED: Color32 = Color32::from_rgb(0xb0, 0x3a, 0x2e);
 
-/// Simulated run length of the prototype; the status shows the times of a real 4K run.
-const DEMO_SECONDS: f64 = 16.0;
-const REAL_SECONDS: f64 = 64.8;
-/// Progress fractions where each stage ends (AI shading, subject, layer, save).
-const STAGE_ENDS: [f64; 4] = [0.78, 0.84, 0.96, 1.0];
+/// Progress fraction where the AI stage ends; the rest is subject mask, shadow layer and finishing.
+const AI_SHARE: f64 = 0.85;
+/// Rough seconds after the last step (decode, subject mask, shadow layer) for the remaining-time estimate.
+const AFTER_STEPS_SECONDS: f64 = 6.0;
+/// Seconds after the last slider change before the shadow layer is re-solved.
+const RESOLVE_DELAY: f64 = 0.35;
 
 const DIR_ICONS: [&str; 9] = [
     ph::ARROW_DOWN_RIGHT,
@@ -65,102 +80,180 @@ enum Phase {
     Running { started: f64 },
     Done { at: f64 },
     Stopped,
+    Failed,
 }
 
-struct LoadedImage {
+#[derive(Clone)]
+struct Input {
+    img: Arc<Image8>,
     tex: TextureHandle,
-    size: [usize; 2],
     name: String,
+}
+
+struct Entry {
+    id: u64,
+    /// Bumped whenever the layers are re-solved.
+    serial: u64,
+    input: Input,
+    result: RunResult,
+    thumb: TextureHandle,
+}
+
+/// Textures of the shown result.
+struct Views {
+    key: (u64, u64),
+    comp_key: Option<(usize, u32)>,
+    composite: TextureHandle,
+    multiply: TextureHandle,
+    overlay: TextureHandle,
+    ai: TextureHandle,
+}
+
+struct Resolve {
+    id: u64,
+    params: Params,
+    rx: Receiver<Layers>,
+}
+
+struct Toast {
+    ok: bool,
+    text: String,
+    at: f64,
+    folder: Option<PathBuf>,
+}
+
+/// Self-screenshot for checking the layout: KAGE_SHOT=<out.png> KAGE_SCENE=<scene> [KAGE_IMAGE=<path>]
+/// [KAGE_LANG=en] [KAGE_AUTO=generate|extract KAGE_SHADED=<path> KAGE_VIEW=multiply|normal|ai
+/// KAGE_RESOLVE=<strength> KAGE_EXPORT=1].
+struct Shot {
+    out: PathBuf,
+    frame: u32,
+    /// Waiting for a run to finish before taking the shot.
+    auto: Option<String>,
+    started: bool,
+    done_frame: Option<u32>,
+    view: Option<LayerView>,
+    /// After the run: change the strength (re-solve), then export.
+    resolve: Option<f32>,
+    export: bool,
 }
 
 struct App {
     lang: Lang,
     screen: Screen,
     settings_tab: usize,
-    image: Option<LoadedImage>,
+    data: PathBuf,
+    cfg: Config,
+    saved_cfg: Config,
+    cfg_changed_at: f64,
+    applied_dirs: (String, String),
+    log: Log,
+    verifier: Verifier,
+    comfy: Comfy,
+
+    image: Option<Input>,
     load_error: Option<String>,
-    dir: usize,
-    strength: f32,
-    bg_shadow: bool,
-    gray: bool,
-    extra: String,
-    ghost: bool,
     seed: String,
+
     phase: Phase,
     stage: usize,
     stage_changed_at: f64,
+    waiting_comfy: bool,
+    steps: (u32, u32),
+    first_step_at: Option<f64>,
+    last_step_at: f64,
+    run_rx: Option<Receiver<Event>>,
+    run_input: Option<Input>,
+    cancel: Arc<AtomicBool>,
+    error: Option<String>,
+
+    history: Vec<Entry>,
+    next_id: u64,
+    current: Option<u64>,
+    views: Option<Views>,
+    resolve: Option<Resolve>,
+    post_seen: (f32, bool, bool),
+    post_changed_at: f64,
+
     layer_menu_open: bool,
     layer_view: LayerView,
-    blend: usize,
     opacity: f32,
     compare_on: bool,
     compare: f32,
     zoom: Option<f32>,
     pan: Vec2,
     history_open: bool,
-    history_sel: usize,
     export_open: bool,
-    targets: [bool; 3],
-    format: usize,
-    png_level: u8,
-    quality: u8,
-    out_dir: String,
-    model_dir: String,
-    comfy_dir: String,
-    rechecked: bool,
-    keep_loaded: bool,
+    export_rx: Option<Receiver<Result<(usize, PathBuf), String>>>,
+    toast: Option<Toast>,
     log_level: usize,
+    log_seen: u64,
     adv_default_open: bool,
     shot: Option<Shot>,
-}
-
-/// Self-screenshot for checking the layout: KAGE_SHOT=<out.png> KAGE_SCENE=<scene> [KAGE_IMAGE=<path>] [KAGE_LANG=en].
-struct Shot {
-    out: std::path::PathBuf,
-    frame: u32,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
+        let data = config::data_dir();
+        let (cfg, cfg_error) = Config::load(&data);
+        let log = Log::new(&data.join("logs"));
+        log.info(format!("Atozuke Kage MOD {} started (data: {})", env!("CARGO_PKG_VERSION"), data.display()));
+        if let Some(e) = cfg_error {
+            log.warn(e);
+        }
+        let verifier = Verifier::new(&data, log.clone());
+        let comfy = Comfy::new(&data, log.clone());
+        verifier.start(PathBuf::from(&cfg.model_dir));
+        comfy.start(&cfg.comfy_dir, Path::new(&cfg.model_dir));
+        let lang = if cfg.lang == "en" { Lang::En } else { Lang::Ja };
         Self {
-            lang: Lang::Ja,
+            lang,
             screen: Screen::Main,
             settings_tab: 0,
+            applied_dirs: (cfg.model_dir.clone(), cfg.comfy_dir.clone()),
+            post_seen: (cfg.strength, cfg.gray, cfg.ghost),
+            saved_cfg: cfg.clone(),
+            cfg,
+            cfg_changed_at: 0.0,
+            data,
+            log,
+            verifier,
+            comfy,
             image: None,
             load_error: None,
-            dir: 0,
-            strength: 1.0,
-            bg_shadow: false,
-            gray: false,
-            extra: String::new(),
-            ghost: false,
             seed: "random".into(),
             phase: Phase::Idle,
             stage: 0,
             stage_changed_at: 0.0,
+            waiting_comfy: false,
+            steps: (0, 0),
+            first_step_at: None,
+            last_step_at: 0.0,
+            run_rx: None,
+            run_input: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            error: None,
+            history: Vec::new(),
+            next_id: 1,
+            current: None,
+            views: None,
+            resolve: None,
+            post_changed_at: 0.0,
             layer_menu_open: false,
             layer_view: LayerView::Result,
-            blend: 0,
             opacity: 1.0,
             compare_on: true,
             compare: 0.5,
             zoom: None,
             pan: Vec2::ZERO,
             history_open: false,
-            history_sel: 0,
             export_open: false,
-            targets: [true, false, true],
-            format: 0,
-            png_level: 6,
-            quality: 92,
-            out_dir: r"C:\Users\(user)\Pictures\AtozukeKageMOD".into(),
-            model_dir: r"D:\AtozukeKageMOD\models".into(),
-            comfy_dir: r"D:\ComfyUI_windows_portable".into(),
-            rechecked: false,
-            keep_loaded: true,
+            export_rx: None,
+            toast: None,
             log_level: 0,
+            log_seen: 0,
             adv_default_open: false,
             shot: None,
         }
@@ -169,23 +262,32 @@ impl App {
 
     fn with_scene(mut self, ctx: &egui::Context) -> Self {
         let Ok(out) = std::env::var("KAGE_SHOT") else { return self };
-        self.shot = Some(Shot { out: out.into(), frame: 0 });
+        let view = match std::env::var("KAGE_VIEW").as_deref() {
+            Ok("multiply") => Some(LayerView::Multiply),
+            Ok("normal") => Some(LayerView::Normal),
+            Ok("ai") => Some(LayerView::Ai),
+            _ => None,
+        };
+        self.shot = Some(Shot {
+            out: out.into(),
+            frame: 0,
+            auto: std::env::var("KAGE_AUTO").ok(),
+            started: false,
+            done_frame: None,
+            view,
+            resolve: std::env::var("KAGE_RESOLVE").ok().and_then(|v| v.parse().ok()),
+            export: std::env::var("KAGE_EXPORT").is_ok(),
+        });
         if std::env::var("KAGE_LANG").as_deref() == Ok("en") {
             self.lang = Lang::En;
         }
         let scene = std::env::var("KAGE_SCENE").unwrap_or_default();
         if scene != "empty" {
             if let Ok(path) = std::env::var("KAGE_IMAGE") {
-                self.open_path(ctx, std::path::Path::new(&path));
-                self.phase = Phase::Done { at: -10.0 };
+                self.open_path(ctx, Path::new(&path));
             }
         }
         match scene.as_str() {
-            "running" => {
-                self.phase = Phase::Running { started: -0.4 * DEMO_SECONDS };
-                self.stage = 0;
-                self.stage_changed_at = -10.0;
-            }
             "layers" => self.layer_menu_open = true,
             "advanced" => self.adv_default_open = true,
             "history" => self.history_open = true,
@@ -207,10 +309,40 @@ impl App {
     fn handle_shot(&mut self, ctx: &egui::Context) {
         let Some(shot) = &mut self.shot else { return };
         shot.frame += 1;
-        if shot.frame == 15 {
+        ctx.request_repaint();
+        let mut start: Option<String> = None;
+        let mut export = false;
+        let take = match &shot.auto {
+            None => shot.frame == 15,
+            Some(auto) => {
+                if !shot.started && self.image.is_some() && (auto == "extract" || (self.verifier.all_ok() && self.comfy.url().is_some())) {
+                    shot.started = true;
+                    start = Some(auto.clone());
+                }
+                let shown_strength = self.current.and_then(|id| self.history.iter().find(|e| e.id == id)).map(|e| e.result.params.strength);
+                let settled = matches!(self.phase, Phase::Done { .. } | Phase::Failed)
+                    && self.resolve.is_none()
+                    && self.export_rx.is_none()
+                    && (shown_strength.is_none() || shown_strength == Some(self.cfg.strength));
+                if shot.done_frame.is_none() && settled {
+                    if let Some(k) = shot.resolve.take() {
+                        self.cfg.strength = k;
+                    } else if shot.export {
+                        shot.export = false;
+                        export = true;
+                    } else {
+                        shot.done_frame = Some(shot.frame);
+                        if let Some(v) = shot.view {
+                            self.layer_view = v;
+                        }
+                    }
+                }
+                shot.done_frame.is_some_and(|f| shot.frame == f + 20)
+            }
+        };
+        if take {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
-        ctx.request_repaint();
         let events = ctx.input(|i| i.raw.events.clone());
         for event in events {
             if let egui::Event::Screenshot { image, .. } = event {
@@ -221,65 +353,388 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+        if export {
+            self.export(ctx);
+        }
+        match start.as_deref() {
+            Some("extract") => {
+                if let Ok(p) = std::env::var("KAGE_SHADED") {
+                    self.cfg.bg_shadow = std::env::var("KAGE_BG").as_deref() != Ok("0");
+                    if let Ok(img) = load_image(Path::new(&p)) {
+                        self.start_run(ctx, Some(Arc::new(img)));
+                    }
+                }
+            }
+            Some(_) => self.start_run(ctx, None),
+            None => {}
+        }
     }
 
     fn t(&self) -> &'static T {
         t(self.lang)
     }
 
-    fn open_path(&mut self, ctx: &egui::Context, path: &std::path::Path) {
-        match image::open(path) {
+    fn running(&self) -> bool {
+        matches!(self.phase, Phase::Running { .. })
+    }
+
+    fn open_path(&mut self, ctx: &egui::Context, path: &Path) {
+        match load_image(path) {
             Ok(img) => {
-                let rgba = img.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                let tex = ctx.load_texture("input", color, egui::TextureOptions::LINEAR);
+                let tex = ctx.load_texture("input", color_image(&img.rgba, img.w, img.h, max_side(ctx)), egui::TextureOptions::LINEAR);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.image = Some(LoadedImage { tex, size, name });
+                self.log.info(format!("Opened {name} {}x{}", img.w, img.h));
+                self.image = Some(Input { img: Arc::new(img), tex, name });
                 self.load_error = None;
                 self.zoom = None;
                 self.pan = Vec2::ZERO;
-                self.phase = Phase::Idle;
+                self.current = None;
+                if !self.running() {
+                    self.phase = Phase::Idle;
+                }
             }
-            Err(e) => self.load_error = Some(e.to_string()),
+            Err(e) => {
+                self.log.error(format!("Could not open {}: {e}", path.display()));
+                self.load_error = Some(e);
+            }
         }
     }
 
     fn pick_image(&mut self, ctx: &egui::Context) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-            .pick_file()
-        {
+        if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "webp"]).pick_file() {
             self.open_path(ctx, &path);
         }
     }
 
-    /// Progress 0..1 of the simulated run.
-    fn progress(&self, now: f64) -> f64 {
-        match self.phase {
-            Phase::Running { started } => ((now - started) / DEMO_SECONDS).clamp(0.0, 1.0),
-            Phase::Done { .. } => 1.0,
-            _ => 0.0,
+    fn params(&self, seed: u64) -> Params {
+        Params {
+            light_dir: self.cfg.light_dir,
+            extra: self.cfg.extra.clone(),
+            strength: self.cfg.strength,
+            background: self.cfg.bg_shadow,
+            gray: self.cfg.gray,
+            ghost: self.cfg.ghost,
+            seed,
         }
+    }
+
+    /// Models verified and ComfyUI usable (running or starting).
+    fn ready(&self) -> bool {
+        self.verifier.all_ok() && matches!(self.comfy.state(), comfy::State::Ready { .. } | comfy::State::Starting)
+    }
+
+    fn start_run(&mut self, ctx: &egui::Context, shaded: Option<Arc<Image8>>) {
+        let Some(input) = self.image.clone() else { return };
+        // Keep random seeds below 2^53 so they survive any JSON round trip and are easy to copy.
+        let seed = self.seed.trim().parse::<u64>().unwrap_or_else(|_| comfy::random_u64() >> 11);
+        let (tx, rx) = mpsc::channel();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let repaint = ctx.clone();
+        pipeline::spawn(
+            Request {
+                original: input.img.clone(),
+                name: input.name.clone(),
+                params: self.params(seed),
+                shaded,
+                model_dir: PathBuf::from(&self.cfg.model_dir),
+                keep_loaded: self.cfg.keep_loaded,
+            },
+            pipeline::Ctx {
+                comfy: self.comfy.clone(),
+                verifier: self.verifier.clone(),
+                log: self.log.clone(),
+                cancel: self.cancel.clone(),
+                tx,
+                notify: Arc::new(move || repaint.request_repaint()),
+            },
+        );
+        let now = ctx.input(|i| i.time);
+        self.run_rx = Some(rx);
+        self.run_input = Some(input);
+        self.phase = Phase::Running { started: now };
+        self.stage = 0;
+        self.stage_changed_at = now;
+        self.waiting_comfy = false;
+        self.steps = (0, 0);
+        self.first_step_at = None;
+        self.error = None;
+        self.layer_view = LayerView::Result;
+    }
+
+    fn entry(&self, id: Option<u64>) -> Option<&Entry> {
+        id.and_then(|id| self.history.iter().find(|e| e.id == id))
+    }
+
+    fn select_entry(&mut self, id: u64) {
+        let Some(e) = self.history.iter().find(|e| e.id == id) else { return };
+        let p = &e.result.params;
+        self.cfg.light_dir = p.light_dir;
+        self.cfg.extra = p.extra.clone();
+        self.cfg.strength = p.strength;
+        self.cfg.bg_shadow = p.background;
+        self.cfg.gray = p.gray;
+        self.cfg.ghost = p.ghost;
+        self.post_seen = (p.strength, p.gray, p.ghost);
+        self.image = Some(e.input.clone());
+        self.current = Some(id);
     }
 
     fn tick(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        if let Phase::Running { .. } = self.phase {
-            let p = self.progress(now);
-            let stage = STAGE_ENDS.iter().position(|&end| p < end).unwrap_or(3);
-            if stage != self.stage {
-                self.stage = stage;
-                self.stage_changed_at = now;
+        let events: Vec<Event> = self.run_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for ev in events {
+            match ev {
+                Event::WaitingForComfy => self.waiting_comfy = true,
+                Event::Stage(s) => {
+                    self.waiting_comfy = false;
+                    if s != self.stage {
+                        self.stage = s;
+                        self.stage_changed_at = now;
+                    }
+                }
+                Event::Steps(v, m) => {
+                    self.waiting_comfy = false;
+                    if self.first_step_at.is_none() {
+                        self.first_step_at = Some(now);
+                    }
+                    self.steps = (v, m);
+                    self.last_step_at = now;
+                }
+                Event::Done(r) => {
+                    let input = self.run_input.take().unwrap_or_else(|| self.image.clone().expect("input"));
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    let thumb = thumbnail(ctx, &r.layers.preview, r.layers.w, r.layers.h);
+                    self.history.insert(0, Entry { id, serial: 0, input, result: *r, thumb });
+                    self.history.truncate(30);
+                    if self.image.as_ref().is_some_and(|i| Arc::ptr_eq(&i.img, &self.history[0].input.img)) {
+                        self.current = Some(id);
+                    }
+                    self.phase = Phase::Done { at: now };
+                    self.run_rx = None;
+                }
+                Event::Failed(msg) => {
+                    self.error = Some(msg);
+                    self.phase = Phase::Failed;
+                    self.run_rx = None;
+                }
+                Event::Cancelled => {
+                    self.phase = Phase::Stopped;
+                    self.run_rx = None;
+                }
             }
-            if p >= 1.0 {
-                self.phase = Phase::Done { at: now };
-            }
+        }
+        if self.running() {
             ctx.request_repaint();
         }
         if let Phase::Done { at } = self.phase {
             if now - at < 0.5 {
                 ctx.request_repaint();
+            }
+        }
+        self.tick_resolve(ctx, now);
+        self.tick_export(ctx, now);
+        self.tick_config(now);
+    }
+
+    /// Strength / gray / double-line changes re-solve the shown layer from the saved AI output (no new AI run).
+    fn tick_resolve(&mut self, ctx: &egui::Context, now: f64) {
+        if let Some(r) = &self.resolve {
+            if let Ok(layers) = r.rx.try_recv() {
+                let (id, params) = (r.id, r.params.clone());
+                self.resolve = None;
+                if let Some(e) = self.history.iter_mut().find(|e| e.id == id) {
+                    e.thumb = thumbnail(ctx, &layers.preview, layers.w, layers.h);
+                    e.result.layers = layers;
+                    e.result.params = params;
+                    e.serial += 1;
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
+        let seen = (self.cfg.strength, self.cfg.gray, self.cfg.ghost);
+        if seen != self.post_seen {
+            self.post_seen = seen;
+            self.post_changed_at = now;
+        }
+        if self.running() {
+            return;
+        }
+        let Some(e) = self.entry(self.current) else { return };
+        let p = &e.result.params;
+        if (p.strength, p.gray, p.ghost) == seen {
+            return;
+        }
+        if now - self.post_changed_at < RESOLVE_DELAY {
+            ctx.request_repaint();
+            return;
+        }
+        let params = Params { strength: seen.0, gray: seen.1, ghost: seen.2, ..p.clone() };
+        let (original, shaded, mask, log) = (e.result.original.clone(), e.result.shaded.clone(), e.result.mask.clone(), self.log.clone());
+        let (tx, rx) = mpsc::channel();
+        let p2 = params.clone();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let layers = pipeline::solve(&original, &shaded, mask.as_deref(), &p2, &log);
+            let _ = tx.send(layers);
+            repaint.request_repaint();
+        });
+        self.resolve = Some(Resolve { id: e.id, params, rx });
+    }
+
+    fn tick_config(&mut self, now: f64) {
+        self.cfg.lang = if self.lang == Lang::En { "en" } else { "ja" }.into();
+        if self.cfg != self.saved_cfg {
+            if self.cfg_changed_at == 0.0 {
+                self.cfg_changed_at = now;
+            } else if now - self.cfg_changed_at > 1.0 {
+                self.save_config();
+            }
+        }
+    }
+
+    fn save_config(&mut self) {
+        if let Err(e) = self.cfg.save(&self.data) {
+            self.log.error(format!("Could not save the settings: {e}"));
+        }
+        self.saved_cfg = self.cfg.clone();
+        self.cfg_changed_at = 0.0;
+    }
+
+    /// Apply changed model / ComfyUI folders: re-verify and restart ComfyUI (it reads the model paths at start).
+    fn apply_dirs(&mut self) {
+        let dirs = (self.cfg.model_dir.trim().to_string(), self.cfg.comfy_dir.trim().to_string());
+        if dirs == self.applied_dirs {
+            return;
+        }
+        if dirs.0 != self.applied_dirs.0 {
+            self.verifier.start(PathBuf::from(&dirs.0));
+        }
+        self.comfy.start(&dirs.1, Path::new(&dirs.0));
+        self.applied_dirs = dirs;
+    }
+
+    fn ensure_views(&mut self, ctx: &egui::Context) {
+        // Field-level borrow so self.views can be replaced below.
+        let Some(e) = self.current.and_then(|id| self.history.iter().find(|e| e.id == id)) else {
+            self.views = None;
+            return;
+        };
+        let key = (e.id, e.serial);
+        let max = max_side(ctx);
+        let l = &e.result.layers;
+        if self.views.as_ref().map(|v| v.key) != Some(key) {
+            let mul = layer_rgba(&l.multiply, l.color);
+            let opts = egui::TextureOptions::LINEAR;
+            let s = &e.result.shaded;
+            self.views = Some(Views {
+                key,
+                comp_key: None,
+                composite: ctx.load_texture("composite", color_image(&l.preview, l.w, l.h, max), opts),
+                multiply: ctx.load_texture("multiply", color_image(&mul, l.w, l.h, max), opts),
+                overlay: ctx.load_texture("overlay", color_image(&l.overlay, l.w, l.h, max), opts),
+                ai: ctx.load_texture("ai", color_image(&s.rgba, s.w, s.h, max), opts),
+            });
+        }
+        let comp_key = (self.cfg.blend, (self.opacity * 1000.0).round() as u32);
+        let views = self.views.as_mut().expect("views");
+        if views.comp_key != Some(comp_key) {
+            // Not layers.preview: that one is computed over white (Python semantics), which lightens half-transparent pixels.
+            let rgba = blend::composite(&e.result.original.rgba, &l.multiply, if l.color { 3 } else { 1 }, MODES[self.cfg.blend], self.opacity);
+            views.composite.set(color_image(&rgba, l.w, l.h, max), egui::TextureOptions::LINEAR);
+            views.comp_key = Some(comp_key);
+        }
+    }
+
+    fn export(&mut self, ctx: &egui::Context) {
+        let t = self.t();
+        let now = ctx.input(|i| i.time);
+        let Some(e) = self.entry(self.current) else { return };
+        let targets = self.cfg.export_targets;
+        if !targets.iter().any(|&x| x) {
+            self.toast = Some(Toast { ok: false, text: t.nothing_to_export.into(), at: now, folder: None });
+            return;
+        }
+        let r = &e.result;
+        let original = r.original.clone();
+        let shaded = r.shaded.clone();
+        let (w, h, color) = (r.layers.w, r.layers.h, r.layers.color);
+        let multiply = r.layers.multiply.clone();
+        let mode = MODES[self.cfg.blend];
+        let opacity = self.opacity;
+        let format = FORMATS[self.cfg.export_format.min(3)];
+        let (png_level, quality) = (self.cfg.png_level, self.cfg.quality);
+        let dir = PathBuf::from(self.cfg.out_dir.trim());
+        let stem = Path::new(&r.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+        let names = (t.views[0], t.views[1], t.views[3]);
+        let log = self.log.clone();
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(usize, PathBuf), String> {
+                std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                let lch = if color { 3 } else { 1 };
+                let composite = blend::composite(&original.rgba, &multiply, lch, mode, opacity);
+                let mut written = Vec::new();
+                if format == Format::Psd {
+                    let mut layers = vec![PsdLayer { name: "Original", rgba: original.rgba.clone(), mode: None, opacity: 1.0, visible: true }];
+                    if targets[1] {
+                        let ai = export::to_canvas_rgba(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, w, h);
+                        layers.push(PsdLayer { name: names.2, rgba: ai, mode: None, opacity: 1.0, visible: false });
+                    }
+                    layers.push(PsdLayer { name: names.1, rgba: layer_rgba(&multiply, color), mode: Some(mode), opacity, visible: true });
+                    let path = export::unique_path(&dir, &stem, "kage", "psd");
+                    export::save_psd(&path, w, h, &layers, &composite)?;
+                    written.push(path);
+                } else {
+                    let ext = format.ext();
+                    if targets[0] {
+                        let path = export::unique_path(&dir, &stem, "shadow", ext);
+                        export::save(&Pixels { w, h, channels: lch, data: &multiply }, &path, format, png_level, quality)?;
+                        written.push(path);
+                    }
+                    if targets[1] {
+                        let path = export::unique_path(&dir, &stem, "ai", ext);
+                        export::save(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, &path, format, png_level, quality)?;
+                        written.push(path);
+                    }
+                    if targets[2] {
+                        let path = export::unique_path(&dir, &stem, "shaded", ext);
+                        export::save(&Pixels { w, h, channels: 4, data: &composite }, &path, format, png_level, quality)?;
+                        written.push(path);
+                    }
+                }
+                for p in &written {
+                    log.info(format!("Exported {}", p.display()));
+                }
+                Ok((written.len(), dir.clone()))
+            })();
+            if let Err(e) = &result {
+                log.error(format!("Export failed: {e}"));
+            }
+            let _ = tx.send(result);
+            repaint.request_repaint();
+        });
+        self.export_rx = Some(rx);
+    }
+
+    fn tick_export(&mut self, ctx: &egui::Context, now: f64) {
+        let t = self.t();
+        if let Some(rx) = &self.export_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.export_rx = None;
+                self.toast = Some(match result {
+                    Ok((n, dir)) => Toast { ok: true, text: t.exported.replace("{}", &n.to_string()), at: now, folder: Some(dir) },
+                    Err(e) => Toast { ok: false, text: format!("{}: {e}", t.export_failed), at: now, folder: None },
+                });
+            }
+        }
+        if let Some(toast) = &self.toast {
+            if now - toast.at > 6.0 {
+                self.toast = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
     }
@@ -288,19 +743,22 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
+        let has_result = self.current.is_some();
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
             ui.label(RichText::new(t.app_name).strong().color(TEXT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .button(format!("{}  {}", ph::GEAR_SIX, t.settings))
-                    .on_hover_text(t.settings_tip)
-                    .clicked()
-                {
+                if ui.button(format!("{}  {}", ph::GEAR_SIX, t.settings)).on_hover_text(t.settings_tip).clicked() {
                     self.screen = Screen::Settings;
                 }
-                ui.label(RichText::new(format!("●  {}", t.model_ok)).color(GREEN))
-                    .on_hover_text(t.model_ok_tip);
+                let (text, color, tip, tab) = self.readiness(t);
+                let r = ui.add(egui::Label::new(RichText::new(format!("●  {text}")).color(color)).sense(Sense::click()));
+                if r.on_hover_text(tip).clicked() {
+                    if let Some(tab) = tab {
+                        self.screen = Screen::Settings;
+                        self.settings_tab = tab;
+                    }
+                }
                 self.language_combo(ui);
                 ui.separator();
                 if ui
@@ -311,7 +769,7 @@ impl App {
                     self.history_open = !self.history_open;
                 }
                 if ui
-                    .add_enabled(self.image.is_some(), Button::icon_text(ph::DOWNLOAD_SIMPLE, t.export))
+                    .add_enabled(has_result && self.export_rx.is_none(), Button::icon_text(ph::DOWNLOAD_SIMPLE, t.export))
                     .on_hover_text(t.export_tip)
                     .clicked()
                 {
@@ -319,6 +777,21 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Toolbar status: text, color, tooltip and the settings tab it leads to.
+    fn readiness(&self, t: &'static T) -> (&'static str, Color32, &'static str, Option<usize>) {
+        if self.verifier.running() {
+            return (t.model_checking, BLUE, t.model_missing_tip, Some(0));
+        }
+        if !self.verifier.all_ok() {
+            return (t.model_missing, AMBER, t.model_missing_tip, Some(0));
+        }
+        match self.comfy.state() {
+            comfy::State::Ready { .. } => (t.model_ok, GREEN, t.model_ok_tip, None),
+            comfy::State::Starting => (t.comfy_starting, BLUE, t.comfy_not_ready_tip, Some(1)),
+            _ => (t.comfy_not_ready, AMBER, t.comfy_not_ready_tip, Some(1)),
+        }
     }
 
     fn language_combo(&mut self, ui: &mut egui::Ui) {
@@ -341,72 +814,52 @@ impl App {
     fn controls(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         let ctx = ui.ctx().clone();
-        let running = matches!(self.phase, Phase::Running { .. });
+        let running = self.running();
+        let ready = self.ready();
 
-        egui::Panel::bottom("generate")
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(0, 10)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let w = ui.available_width() - 84.0 - ui.spacing().item_spacing.x;
-                    let gen = egui::Button::new(
-                        RichText::new(format!("{}  {}", ph::PLAY, t.generate)).size(16.0).strong().color(BLUE),
-                    )
+        egui::Panel::bottom("generate").frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(0, 10))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 84.0 - ui.spacing().item_spacing.x;
+                let gen = egui::Button::new(RichText::new(format!("{}  {}", ph::PLAY, t.generate)).size(16.0).strong().color(BLUE))
                     .fill(SEL)
                     .stroke(Stroke::new(1.0, BLUE));
-                    if ui
-                        .add_enabled_ui(self.image.is_some() && !running, |ui| ui.add_sized([w, 48.0], gen))
-                        .inner
-                        .on_hover_text(t.generate_tip)
-                        .clicked()
-                    {
-                        let now = ctx.input(|i| i.time);
-                        self.phase = Phase::Running { started: now };
-                        self.stage = 0;
-                        self.stage_changed_at = now;
-                        self.layer_view = LayerView::Result;
-                    }
-                    let stop = egui::Button::new(RichText::new(format!("{}  {}", ph::STOP, t.stop)).size(14.0));
-                    if ui
-                        .add_enabled_ui(running, |ui| ui.add_sized([84.0, 48.0], stop))
-                        .inner
-                        .on_hover_text(t.stop_tip)
-                        .clicked()
-                    {
-                        self.phase = Phase::Stopped;
-                    }
-                });
+                let enabled = self.image.is_some() && !running && ready;
+                let resp = ui.add_enabled_ui(enabled, |ui| ui.add_sized([w, 48.0], gen)).inner;
+                let resp = if !ready { resp.on_disabled_hover_text(t.not_ready_tip) } else { resp.on_hover_text(t.generate_tip) };
+                if resp.clicked() {
+                    self.start_run(&ctx, None);
+                }
+                let stop = egui::Button::new(RichText::new(format!("{}  {}", ph::STOP, t.stop)).size(14.0));
+                if ui.add_enabled_ui(running, |ui| ui.add_sized([84.0, 48.0], stop)).inner.on_hover_text(t.stop_tip).clicked() {
+                    self.cancel.store(true, Ordering::SeqCst);
+                }
             });
+        });
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(10.0);
             // Open / drop box
-            let inner = Frame::new()
-                .fill(Color32::from_rgb(0xfa, 0xfa, 0xfa))
-                .inner_margin(Margin::same(10))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    let open = egui::Button::new(
-                        RichText::new(format!("{}  {}", ph::FOLDER_OPEN, t.open_image)).size(15.0).strong(),
-                    );
-                    if ui.add_sized([ui.available_width(), 44.0], open).on_hover_text(t.open_tip).clicked() {
-                        self.pick_image(&ctx);
-                    }
-                    ui.vertical_centered(|ui| ui.label(RichText::new(t.drop_hint).small().color(MUTED)));
-                    if let Some(img) = &self.image {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&img.name).color(TEXT));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(format!("{}×{}", img.size[0], img.size[1])).monospace().color(MUTED),
-                                );
-                            });
+            let inner = Frame::new().fill(Color32::from_rgb(0xfa, 0xfa, 0xfa)).inner_margin(Margin::same(10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let open = egui::Button::new(RichText::new(format!("{}  {}", ph::FOLDER_OPEN, t.open_image)).size(15.0).strong());
+                if ui.add_sized([ui.available_width(), 44.0], open).on_hover_text(t.open_tip).clicked() {
+                    self.pick_image(&ctx);
+                }
+                ui.vertical_centered(|ui| ui.label(RichText::new(t.drop_hint).small().color(MUTED)));
+                if let Some(img) = &self.image {
+                    ui.separator();
+                    let row = Vec2::new(ui.available_width(), 20.0);
+                    ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{}×{}", img.img.w, img.img.h)).monospace().color(MUTED));
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(&img.name).color(TEXT)).truncate()).on_hover_text(&img.name);
                         });
-                    }
-                    if let Some(err) = &self.load_error {
-                        ui.label(RichText::new(err).small().color(RED));
-                    }
-                });
+                    });
+                }
+                if let Some(err) = &self.load_error {
+                    ui.label(RichText::new(err).small().color(RED));
+                }
+            });
             dashed_rect(ui.painter(), inner.response.rect, Color32::from_gray(0x9a));
 
             ui.add_space(12.0);
@@ -414,9 +867,9 @@ impl App {
             let w = (ui.available_width() - 6.0) / 3.0;
             egui::Grid::new("dirs").spacing([3.0, 3.0]).show(ui, |ui| {
                 for (i, icon) in DIR_ICONS.iter().enumerate() {
-                    let b = egui::Button::new(RichText::new(*icon).size(17.0)).selected(self.dir == i);
+                    let b = egui::Button::new(RichText::new(*icon).size(17.0)).selected(self.cfg.light_dir == i);
                     if ui.add_sized([w, 34.0], b).on_hover_text(t.light_tips[i]).clicked() {
-                        self.dir = i;
+                        self.cfg.light_dir = i;
                     }
                     if i % 3 == 2 {
                         ui.end_row();
@@ -428,15 +881,15 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(t.strength).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("× {:.1}", self.strength)).monospace());
+                    ui.label(RichText::new(format!("× {:.1}", self.cfg.strength)).monospace());
                 });
             });
             ui.spacing_mut().slider_width = ui.available_width();
-            ui.add(egui::Slider::new(&mut self.strength, 0.5..=1.5).step_by(0.1).show_value(false));
+            ui.add(egui::Slider::new(&mut self.cfg.strength, 0.5..=1.5).step_by(0.1).show_value(false));
 
             ui.add_space(10.0);
-            ui.checkbox(&mut self.bg_shadow, t.bg_shadow).on_hover_text(t.bg_tip);
-            ui.checkbox(&mut self.gray, t.gray).on_hover_text(t.gray_tip);
+            ui.checkbox(&mut self.cfg.bg_shadow, t.bg_shadow).on_hover_text(t.bg_tip);
+            ui.checkbox(&mut self.cfg.gray, t.gray).on_hover_text(t.gray_tip);
 
             ui.add_space(8.0);
             ui.separator();
@@ -445,14 +898,10 @@ impl App {
                 .default_open(self.adv_default_open)
                 .show(ui, |ui| {
                     ui.label(t.extra);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.extra)
-                            .hint_text("warm sunset light")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut self.cfg.extra).hint_text("warm sunset light").desired_width(f32::INFINITY));
                     ui.label(RichText::new(t.extra_desc).small().color(MUTED));
                     ui.add_space(8.0);
-                    ui.checkbox(&mut self.ghost, t.ghost);
+                    ui.checkbox(&mut self.cfg.ghost, t.ghost);
                     ui.label(RichText::new(t.ghost_desc).small().color(MUTED));
                     ui.add_space(8.0);
                     ui.label(t.seed);
@@ -465,7 +914,19 @@ impl App {
                     ui.label(RichText::new(t.seed_desc).small().color(MUTED));
                     ui.add_space(8.0);
                     let b = egui::Button::new(format!("{}  {}", ph::SELECTION_FOREGROUND, t.extract));
-                    ui.add_enabled(self.image.is_some(), b.min_size(Vec2::new(ui.available_width(), 28.0)));
+                    let can_extract = self.image.is_some() && !running && (self.cfg.bg_shadow || ready);
+                    if ui.add_enabled(can_extract, b.min_size(Vec2::new(ui.available_width(), 28.0))).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title(t.pick_shaded)
+                            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                            .pick_file()
+                        {
+                            match load_image(&path) {
+                                Ok(img) => self.start_run(&ctx, Some(Arc::new(img))),
+                                Err(e) => self.load_error = Some(e),
+                            }
+                        }
+                    }
                     ui.label(RichText::new(t.extract_desc).small().color(MUTED));
                 });
         });
@@ -478,34 +939,27 @@ impl App {
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 
-        let Some(img) = &self.image else {
+        let Some(img) = self.image.clone() else {
             let inner = rect.shrink(24.0);
             dashed_rect(&painter, inner, Color32::from_gray(0x9a));
-            painter.text(
-                inner.center() - Vec2::new(0.0, 14.0),
-                Align2::CENTER_CENTER,
-                ph::UPLOAD_SIMPLE,
-                FontId::proportional(40.0),
-                MUTED,
-            );
-            painter.text(
-                inner.center() + Vec2::new(0.0, 24.0),
-                Align2::CENTER_CENTER,
-                t.drop_here,
-                FontId::proportional(15.0),
-                MUTED,
-            );
+            painter.text(inner.center() - Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, ph::UPLOAD_SIMPLE, FontId::proportional(40.0), MUTED);
+            painter.text(inner.center() + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, t.drop_here, FontId::proportional(15.0), MUTED);
             return;
         };
+        self.ensure_views(&ctx);
+        let has_result = self.views.is_some();
+        if !has_result {
+            self.layer_view = LayerView::Result;
+        }
 
         // Pan (drag) and zoom (wheel, around the cursor).
-        let size = Vec2::new(img.size[0] as f32, img.size[1] as f32);
+        let size = Vec2::new(img.img.w as f32, img.img.h as f32);
         let fit = ((rect.width() - 48.0) / size.x).min((rect.height() - 48.0) / size.y);
         let mut scale = self.zoom.unwrap_or(fit);
         let mut divider_drag = false;
         let img_rect = Rect::from_center_size(rect.center() + self.pan, size * scale);
         let divider_x = img_rect.left() + img_rect.width() * self.compare;
-        let compare_active = self.compare_on && self.layer_view == LayerView::Result;
+        let compare_active = has_result && self.compare_on && self.layer_view == LayerView::Result;
         if compare_active {
             let handle = Rect::from_x_y_ranges(divider_x - 8.0..=divider_x + 8.0, img_rect.y_range());
             let h = ui.interact(handle, Id::new("divider"), Sense::drag());
@@ -535,17 +989,17 @@ impl App {
         let img_rect = Rect::from_center_size(rect.center() + self.pan, size * scale);
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         painter.rect_filled(img_rect.expand(1.0), CornerRadius::ZERO, Color32::from_black_alpha(40));
+        if img.img.has_alpha {
+            checkerboard(&painter, img_rect.intersect(rect));
+        }
 
-        // Prototype shading: a uniform darkening stands in for the real shadow layer.
-        let shade = (255.0 - 70.0 * self.strength * self.opacity).clamp(0.0, 255.0) as u8;
-        let tint = if self.gray { Color32::from_gray(shade) } else { Color32::from_rgb(shade, shade.saturating_sub(12), shade.saturating_sub(4)) };
-        match self.layer_view {
-            LayerView::Result => {
+        match (&self.views, self.layer_view) {
+            (Some(v), LayerView::Result) => {
                 painter.image(img.tex.id(), img_rect, full_uv, Color32::WHITE);
                 let split = if compare_active { self.compare } else { 1.0 };
                 let shaded = Rect::from_min_max(img_rect.min, Pos2::new(img_rect.left() + img_rect.width() * split, img_rect.bottom()));
                 let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(split, 1.0));
-                painter.image(img.tex.id(), shaded, uv, tint);
+                painter.image(v.composite.id(), shaded, uv, Color32::WHITE);
                 if compare_active {
                     let x = img_rect.left() + img_rect.width() * self.compare;
                     painter.line_segment([Pos2::new(x, img_rect.top()), Pos2::new(x, img_rect.bottom())], Stroke::new(2.0, Color32::WHITE));
@@ -555,23 +1009,25 @@ impl App {
                     painter.text(knob.center(), Align2::CENTER_CENTER, ph::ARROWS_LEFT_RIGHT, FontId::proportional(14.0), TEXT);
                 }
             }
-            LayerView::Multiply => {
-                painter.rect_filled(img_rect, CornerRadius::ZERO, Color32::WHITE);
-                painter.text(img_rect.center(), Align2::CENTER_CENTER, t.prototype_note, FontId::proportional(13.0), MUTED);
+            (Some(v), LayerView::Multiply) => {
+                painter.image(v.multiply.id(), img_rect, full_uv, Color32::WHITE);
             }
-            LayerView::Normal => {
+            (Some(v), LayerView::Normal) => {
                 checkerboard(&painter, img_rect.intersect(rect));
-                painter.text(img_rect.center(), Align2::CENTER_CENTER, t.prototype_note, FontId::proportional(13.0), MUTED);
+                painter.image(v.overlay.id(), img_rect, full_uv, Color32::WHITE);
             }
-            LayerView::Ai => {
-                painter.image(img.tex.id(), img_rect, full_uv, tint);
+            (Some(v), LayerView::Ai) => {
+                painter.image(v.ai.id(), img_rect, full_uv, Color32::WHITE);
+            }
+            (None, _) => {
+                painter.image(img.tex.id(), img_rect, full_uv, Color32::WHITE);
             }
         }
 
-        self.canvas_overlays(&ctx, rect, scale, fit);
+        self.canvas_overlays(&ctx, rect, scale, has_result);
     }
 
-    fn canvas_overlays(&mut self, ctx: &egui::Context, rect: Rect, scale: f32, fit: f32) {
+    fn canvas_overlays(&mut self, ctx: &egui::Context, rect: Rect, scale: f32, has_result: bool) {
         let t = self.t();
         let overlay = Frame::new()
             .fill(PANEL)
@@ -580,46 +1036,40 @@ impl App {
             .inner_margin(Margin::symmetric(6, 4));
 
         // Layer menu (top left)
-        egui::Area::new(Id::new("layer_menu"))
-            .fixed_pos(rect.left_top() + Vec2::new(8.0, 8.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                overlay.show(ui, |ui| {
-                    let label = match self.layer_view {
-                        LayerView::Result => format!("{}  {} · {}  {}", ph::STACK, t.views[0], t.blends[self.blend], ph::CARET_DOWN),
-                        v => format!("{}  {}  {}", ph::STACK, t.views[v as usize], ph::CARET_DOWN),
-                    };
-                    if ui.add(egui::Button::new(label).frame(false)).on_hover_text(t.layer_tip).clicked() {
-                        self.layer_menu_open = !self.layer_menu_open;
+        egui::Area::new(Id::new("layer_menu")).fixed_pos(rect.left_top() + Vec2::new(8.0, 8.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+            overlay.show(ui, |ui| {
+                let label = match self.layer_view {
+                    LayerView::Result => format!("{}  {} · {}  {}", ph::STACK, t.views[0], t.blends[self.cfg.blend], ph::CARET_DOWN),
+                    v => format!("{}  {}  {}", ph::STACK, t.views[v as usize], ph::CARET_DOWN),
+                };
+                if ui.add(egui::Button::new(label).frame(false)).on_hover_text(t.layer_tip).clicked() {
+                    self.layer_menu_open = !self.layer_menu_open;
+                }
+                if self.layer_menu_open {
+                    ui.separator();
+                    ui.set_width(250.0);
+                    ui.label(RichText::new(t.view).strong());
+                    for (i, v) in [LayerView::Result, LayerView::Multiply, LayerView::Normal, LayerView::Ai].into_iter().enumerate() {
+                        ui.add_enabled_ui(has_result || i == 0, |ui| ui.radio_value(&mut self.layer_view, v, t.views[i]));
                     }
-                    if self.layer_menu_open {
-                        ui.separator();
-                        ui.set_width(250.0);
-                        ui.label(RichText::new(t.view).strong());
-                        for (i, v) in [LayerView::Result, LayerView::Multiply, LayerView::Normal, LayerView::Ai].into_iter().enumerate() {
-                            ui.radio_value(&mut self.layer_view, v, t.views[i]);
+                    ui.separator();
+                    ui.label(RichText::new(t.blend_title).strong());
+                    egui::ComboBox::from_id_salt("blend").width(240.0).selected_text(t.blends[self.cfg.blend]).show_ui(ui, |ui| {
+                        for (i, name) in t.blends.iter().enumerate() {
+                            ui.selectable_value(&mut self.cfg.blend, i, *name);
                         }
-                        ui.separator();
-                        ui.label(RichText::new(t.blend_title).strong());
-                        egui::ComboBox::from_id_salt("blend")
-                            .width(240.0)
-                            .selected_text(t.blends[self.blend])
-                            .show_ui(ui, |ui| {
-                                for (i, name) in t.blends.iter().enumerate() {
-                                    ui.selectable_value(&mut self.blend, i, *name);
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(t.opacity).strong());
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(format!("{:.0}%", self.opacity * 100.0)).monospace());
-                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(t.opacity).strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{:.0}%", self.opacity * 100.0)).monospace());
                         });
-                        ui.spacing_mut().slider_width = 240.0;
-                        ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false));
-                    }
-                });
+                    });
+                    ui.spacing_mut().slider_width = 240.0;
+                    ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false));
+                }
             });
+        });
 
         // Compare toggle (top right)
         egui::Area::new(Id::new("compare"))
@@ -628,7 +1078,7 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 overlay.show(ui, |ui| {
-                    ui.checkbox(&mut self.compare_on, t.compare).on_hover_text(t.compare_tip);
+                    ui.add_enabled_ui(has_result, |ui| ui.checkbox(&mut self.compare_on, t.compare).on_hover_text(t.compare_tip));
                 });
             });
 
@@ -654,10 +1104,35 @@ impl App {
                         if ui.button("1:1").on_hover_text(t.actual_tip).clicked() {
                             self.zoom = Some(1.0);
                         }
-                        let _ = fit;
                     });
                 });
             });
+
+        // Export result (bottom center)
+        if let Some(toast) = &self.toast {
+            let mut open_dir = None;
+            egui::Area::new(Id::new("toast"))
+                .fixed_pos(rect.center_bottom() + Vec2::new(0.0, -12.0))
+                .pivot(Align2::CENTER_BOTTOM)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    overlay.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (icon, color) = if toast.ok { (ph::CHECK_CIRCLE, GREEN) } else { (ph::WARNING_CIRCLE, RED) };
+                            ui.label(RichText::new(icon).size(16.0).color(color));
+                            ui.label(&toast.text);
+                            if let Some(dir) = &toast.folder {
+                                if ui.button(format!("{}  {}", ph::FOLDER_OPEN, t.open_folder)).clicked() {
+                                    open_dir = Some(dir.clone());
+                                }
+                            }
+                        });
+                    });
+                });
+            if let Some(dir) = open_dir {
+                open_in_explorer(&dir);
+            }
+        }
     }
 
     fn history(&mut self, ui: &mut egui::Ui) {
@@ -671,53 +1146,66 @@ impl App {
             });
         });
         ui.separator();
-        let runs = [("1.0", 0usize, false), ("1.2", 2, false), ("1.0", 4, true), ("0.8", 3, false)];
         // "Auto (match the image's light)" -> "Auto": the drawer is narrow.
         let dir_short = |i: usize| {
             let s = t.light_tips[i].split(": ").last().unwrap_or("");
             s.split(['（', '(']).next().unwrap_or(s).trim_end()
         };
+        let mut clicked = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for (i, (k, d, bg)) in runs.iter().enumerate() {
+            for e in &self.history {
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 74.0), Sense::click());
-                if self.history_sel == i {
+                if self.current == Some(e.id) {
                     ui.painter().rect_filled(r, CornerRadius::same(2), SEL);
                     ui.painter().rect_stroke(r, CornerRadius::same(2), Stroke::new(1.0, BLUE), StrokeKind::Inside);
                 } else if resp.hovered() {
                     ui.painter().rect_filled(r, CornerRadius::same(2), Color32::from_gray(0xe6));
                 }
-                let thumb = Rect::from_min_size(r.min + Vec2::new(4.0, 4.0), Vec2::new(37.0, 66.0));
-                match &self.image {
-                    Some(img) => {
-                        ui.painter().image(img.tex.id(), thumb, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-                    }
-                    None => {
-                        ui.painter().rect_filled(thumb, CornerRadius::ZERO, Color32::from_gray(0xb0));
-                    }
-                }
-                let x = thumb.right() + 8.0;
+                let slot = Rect::from_min_size(r.min + Vec2::new(4.0, 4.0), Vec2::new(37.0, 66.0));
+                let ts = e.thumb.size_vec2();
+                let k = (slot.width() / ts.x).min(slot.height() / ts.y);
+                let thumb = Rect::from_center_size(slot.center(), ts * k);
+                ui.painter().image(e.thumb.id(), thumb, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                let x = slot.right() + 8.0;
                 let painter = ui.painter_at(r.shrink(2.0));
-                let title = if self.lang == Lang::Ja { format!("{} {}", runs.len() - i, t.run_n) } else { format!("{} {}", t.run_n, runs.len() - i) };
+                let title = if self.lang == Lang::Ja { format!("{} {}", e.id, t.run_n) } else { format!("{} {}", t.run_n, e.id) };
                 painter.text(Pos2::new(x, r.top() + 18.0), Align2::LEFT_CENTER, title, FontId::proportional(13.0), TEXT);
-                painter.text(Pos2::new(x, r.top() + 39.0), Align2::LEFT_CENTER, dir_short(*d), FontId::proportional(12.0), MUTED);
-                let sub = format!("×{} · {}", k, if *bg { t.with_bg } else { t.subject_only });
+                let p = &e.result.params;
+                let line2 = if e.result.extracted { t.extract.to_string() } else { dir_short(p.light_dir).to_string() };
+                painter.text(Pos2::new(x, r.top() + 39.0), Align2::LEFT_CENTER, line2, FontId::proportional(12.0), MUTED);
+                let sub = format!("×{:.1} · {}", p.strength, if p.background { t.with_bg } else { t.subject_only });
                 painter.text(Pos2::new(x, r.top() + 56.0), Align2::LEFT_CENTER, sub, FontId::proportional(12.0), MUTED);
-                if resp.clicked() {
-                    self.history_sel = i;
+                let tip = format!("{}  ·  {} {}  ·  {:.1} s", e.input.name, t.seed, p.seed, e.result.seconds);
+                if resp.on_hover_text(tip).clicked() {
+                    clicked = Some(e.id);
                 }
             }
         });
+        if let Some(id) = clicked {
+            self.select_entry(id);
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         let now = ui.input(|i| i.time);
-        let p = self.progress(now);
-        let running = matches!(self.phase, Phase::Running { .. });
+        let running = self.running();
+        let resolving = self.resolve.is_some();
+        let p = match self.phase {
+            Phase::Running { .. } => match self.stage {
+                0 if self.steps.1 > 0 => AI_SHARE * self.steps.0 as f64 / self.steps.1 as f64,
+                0 => 0.0,
+                1 => 0.88,
+                2 => 0.95,
+                _ => 0.99,
+            },
+            Phase::Done { .. } => 1.0,
+            _ => 0.0,
+        };
         ui.horizontal_centered(|ui| {
             ui.add_space(4.0);
             match self.phase {
-                Phase::Running { .. } => {
+                _ if running || resolving => {
                     ui.add(egui::Spinner::new().size(16.0).color(BLUE));
                 }
                 Phase::Done { at } => {
@@ -725,6 +1213,9 @@ impl App {
                     let pop = if k < 0.7 { 0.4 + k / 0.7 * 0.75 } else { 1.15 - (k - 0.7) / 0.3 * 0.15 };
                     let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
                     ui.painter().text(r.center(), Align2::CENTER_CENTER, ph::CHECK_CIRCLE, FontId::proportional(18.0 * pop), GREEN);
+                }
+                Phase::Failed => {
+                    ui.label(RichText::new(ph::WARNING_CIRCLE).size(16.0).color(RED));
                 }
                 _ => {
                     ui.label(RichText::new(ph::CIRCLE).size(16.0).color(Color32::from_gray(0x9a)));
@@ -740,21 +1231,24 @@ impl App {
 
             // Stage text: slides in from below whenever the stage changes; dots cycle while running.
             let text = match self.phase {
+                Phase::Running { .. } if self.waiting_comfy => t.waiting_comfy,
                 Phase::Running { .. } => t.running[self.stage],
+                _ if resolving => t.resolving,
                 Phase::Done { .. } => t.done,
                 Phase::Stopped => t.stopped,
+                Phase::Failed => t.failed,
                 Phase::Idle => t.idle,
             };
             let font = FontId::proportional(13.0);
-            let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), TEXT);
+            let color = if matches!(self.phase, Phase::Failed) && !running { RED } else { TEXT };
+            let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), color);
             let dots_w = 16.0;
             let (r, _) = ui.allocate_exact_size(Vec2::new(galley.size().x + dots_w, 20.0), Sense::hover());
             let k = if running { ((now - self.stage_changed_at) / 0.35).clamp(0.0, 1.0) as f32 } else { 1.0 };
             let ease = 1.0 - (1.0 - k).powi(3);
-            let color = TEXT.gamma_multiply(ease);
             let pos = Pos2::new(r.left(), r.center().y - galley.size().y / 2.0 + (1.0 - ease) * 6.0);
-            ui.painter().galley(pos, galley.clone(), color);
-            if running {
+            ui.painter().galley(pos, galley.clone(), color.gamma_multiply(ease));
+            if running || resolving {
                 for d in 0..3 {
                     let phase = ((now * 1.6 - d as f64 * 0.2).rem_euclid(1.2) / 1.2) as f32;
                     let a = if phase < 0.4 { 0.15 + phase / 0.4 * 0.85 } else { 1.0 - (phase - 0.4) / 0.6 * 0.85 };
@@ -763,52 +1257,66 @@ impl App {
                 }
             }
 
-            let detail = match self.phase {
-                Phase::Running { .. } if p < STAGE_ENDS[0] => {
-                    format!("{}/25 {}", ((p / STAGE_ENDS[0]) * 25.0).ceil().max(1.0) as u32, t.steps)
+            if matches!(self.phase, Phase::Failed) {
+                if let Some(err) = &self.error {
+                    let w = (ui.available_width() - 120.0).max(80.0);
+                    ui.add_sized([w, 20.0], egui::Label::new(RichText::new(err).color(RED)).truncate()).on_hover_text(err);
                 }
-                Phase::Running { .. } => format!("{:.0}%", p * 100.0),
-                Phase::Done { .. } => self.image.as_ref().map(|i| format!("{}×{}", i.size[0], i.size[1])).unwrap_or_default(),
-                _ => String::new(),
-            };
-            ui.label(RichText::new(detail).monospace().color(MUTED));
-            ui.add_space(8.0);
+            } else {
+                let detail = match self.phase {
+                    Phase::Running { .. } if self.stage == 0 && !self.waiting_comfy && self.steps.1 == 0 => t.loading_models.to_string(),
+                    Phase::Running { .. } if self.stage == 0 && self.steps.1 > 0 => format!("{}/{} {}", self.steps.0, self.steps.1, t.steps),
+                    Phase::Done { .. } => self.entry(self.current).map(|e| format!("{}×{}", e.result.layers.w, e.result.layers.h)).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                ui.label(RichText::new(detail).monospace().color(MUTED));
+                ui.add_space(8.0);
 
-            // One progress bar; a light band sweeps over the filled part while running.
-            let bar_w = (ui.available_width() * 0.42).clamp(160.0, 520.0);
-            let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 8.0), Sense::hover());
-            ui.painter().rect_filled(bar, CornerRadius::same(1), Color32::from_gray(0xdc));
-            let fill = Rect::from_min_size(bar.min, Vec2::new(bar.width() * p as f32, bar.height()));
-            ui.painter().rect_filled(fill, CornerRadius::same(1), BLUE);
-            if running && fill.width() > 2.0 {
-                let band = 90.0;
-                let x = fill.left() - band + ((now * 220.0) % (fill.width() as f64 + band as f64 * 2.0)) as f32;
-                let mut mesh = egui::Mesh::default();
-                let top = fill.top();
-                let bottom = fill.bottom();
-                let c0 = Color32::from_white_alpha(0);
-                let c1 = Color32::from_white_alpha(110);
-                for (i, (xx, c)) in [(x, c0), (x + band / 2.0, c1), (x + band, c0)].into_iter().enumerate() {
-                    mesh.colored_vertex(Pos2::new(xx, top), c);
-                    mesh.colored_vertex(Pos2::new(xx, bottom), c);
-                    if i > 0 {
-                        let b = (i as u32) * 2;
-                        mesh.add_triangle(b - 2, b - 1, b);
-                        mesh.add_triangle(b - 1, b, b + 1);
+                // One progress bar; a light band sweeps over the filled part while running.
+                let bar_w = (ui.available_width() * 0.42).clamp(160.0, 520.0);
+                let (bar, _) = ui.allocate_exact_size(Vec2::new(bar_w, 8.0), Sense::hover());
+                ui.painter().rect_filled(bar, CornerRadius::same(1), Color32::from_gray(0xdc));
+                let fill = Rect::from_min_size(bar.min, Vec2::new(bar.width() * p as f32, bar.height()));
+                ui.painter().rect_filled(fill, CornerRadius::same(1), BLUE);
+                if running && fill.width() > 2.0 {
+                    let band = 90.0;
+                    let x = fill.left() - band + ((now * 220.0) % (fill.width() as f64 + band as f64 * 2.0)) as f32;
+                    let mut mesh = egui::Mesh::default();
+                    let (top, bottom) = (fill.top(), fill.bottom());
+                    let c0 = Color32::from_white_alpha(0);
+                    let c1 = Color32::from_white_alpha(110);
+                    for (i, (xx, c)) in [(x, c0), (x + band / 2.0, c1), (x + band, c0)].into_iter().enumerate() {
+                        mesh.colored_vertex(Pos2::new(xx, top), c);
+                        mesh.colored_vertex(Pos2::new(xx, bottom), c);
+                        if i > 0 {
+                            let b = (i as u32) * 2;
+                            mesh.add_triangle(b - 2, b - 1, b);
+                            mesh.add_triangle(b - 1, b, b + 1);
+                        }
                     }
+                    ui.painter().with_clip_rect(fill).add(egui::Shape::mesh(mesh));
                 }
-                ui.painter().with_clip_rect(fill).add(egui::Shape::mesh(mesh));
+                ui.add_space(8.0);
+                let time = match self.phase {
+                    Phase::Running { started } => {
+                        let el = now - started;
+                        let left = match (self.first_step_at, self.steps) {
+                            (Some(first), (v, m)) if self.stage == 0 && v >= 2 => {
+                                let per = (self.last_step_at - first) / (v - 1) as f64;
+                                Some((m - v) as f64 * per + AFTER_STEPS_SECONDS - (now - self.last_step_at).min(per))
+                            }
+                            _ => None,
+                        };
+                        match left {
+                            Some(left) => format!("{} {} · {} {}", clock(el), t.elapsed, t.left, clock(left)),
+                            None => format!("{} {}", clock(el), t.elapsed),
+                        }
+                    }
+                    Phase::Done { .. } => self.entry(self.current).map(|e| format!("{:.1} s", e.result.seconds)).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                ui.label(RichText::new(time).monospace().color(MUTED));
             }
-            ui.add_space(8.0);
-            let time = match self.phase {
-                Phase::Running { .. } => {
-                    let el = p * REAL_SECONDS;
-                    format!("{} {} · {} {}", clock(el), t.elapsed, t.left, clock(REAL_SECONDS - el))
-                }
-                Phase::Done { .. } => format!("{REAL_SECONDS:.1} s"),
-                _ => String::new(),
-            };
-            ui.label(RichText::new(time).monospace().color(MUTED));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button(format!("{}  {}", ph::LIST, t.log)).on_hover_text(t.log_tip).clicked() {
@@ -821,51 +1329,53 @@ impl App {
 
     fn export_modal(&mut self, ctx: &egui::Context) {
         let t = self.t();
+        let mut go = false;
         let resp = egui::Modal::new(Id::new("export")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.label(RichText::new(t.export).strong().size(15.0));
             ui.separator();
             for (i, label) in t.export_targets.iter().enumerate() {
-                ui.checkbox(&mut self.targets[i], *label);
+                ui.checkbox(&mut self.cfg.export_targets[i], *label);
             }
             ui.add_space(10.0);
             ui.label(RichText::new(t.format).strong());
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 9.0) / 4.0;
                 for (i, name) in ["PNG", "JPEG", "WebP", "PSD"].iter().enumerate() {
-                    if ui.add_sized([w, 28.0], egui::Button::new(*name).selected(self.format == i)).clicked() {
-                        self.format = i;
+                    if ui.add_sized([w, 28.0], egui::Button::new(*name).selected(self.cfg.export_format == i)).clicked() {
+                        self.cfg.export_format = i;
                     }
                 }
             });
             ui.add_space(10.0);
             ui.spacing_mut().slider_width = 360.0;
-            match self.format {
+            match self.cfg.export_format {
                 0 => {
                     ui.label(RichText::new(t.png_level).strong());
-                    ui.add(egui::Slider::new(&mut self.png_level, 0..=9));
+                    ui.add(egui::Slider::new(&mut self.cfg.png_level, 0..=9));
                 }
                 1 | 2 => {
                     ui.label(RichText::new(t.quality).strong());
-                    ui.add(egui::Slider::new(&mut self.quality, 1..=100));
+                    ui.add(egui::Slider::new(&mut self.cfg.quality, 1..=100));
                 }
                 _ => {}
             }
             ui.add_space(10.0);
             ui.label(RichText::new(t.out_dir).strong());
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.out_dir).desired_width(ui.available_width() - 70.0).font(egui::TextStyle::Monospace));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg.out_dir).desired_width(ui.available_width() - 70.0).font(egui::TextStyle::Monospace));
                 if ui.button(t.browse).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.out_dir = dir.display().to_string();
+                    if let Some(dir) = rfd::FileDialog::new().set_directory(&self.cfg.out_dir).pick_folder() {
+                        self.cfg.out_dir = dir.display().to_string();
                     }
                 }
             });
             ui.add_space(12.0);
             ui.separator();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let go = egui::Button::new(RichText::new(t.do_export).strong().color(BLUE)).fill(SEL).stroke(Stroke::new(1.0, BLUE));
-                if ui.add(go).clicked() {
+                let b = egui::Button::new(RichText::new(t.do_export).strong().color(BLUE)).fill(SEL).stroke(Stroke::new(1.0, BLUE));
+                if ui.add(b).clicked() {
+                    go = true;
                     self.export_open = false;
                 }
                 if ui.button(t.cancel).clicked() {
@@ -876,6 +1386,9 @@ impl App {
         if resp.should_close() {
             self.export_open = false;
         }
+        if go {
+            self.export(ctx);
+        }
     }
 
     // ---- settings screen ---------------------------------------------------------------------------
@@ -884,6 +1397,7 @@ impl App {
         let t = self.t();
         ui.horizontal_centered(|ui| {
             if ui.button(format!("{}  {}", ph::ARROW_LEFT, t.back)).on_hover_text(t.back_tip).clicked() {
+                self.apply_dirs();
                 self.screen = Screen::Main;
             }
             ui.label(RichText::new(t.settings).strong());
@@ -901,17 +1415,25 @@ impl App {
     }
 
     fn models_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {
-        let kinds: [usize; 4] = if self.rechecked { [0, 0, 0, 0] } else { [0, 1, 2, 3] };
-        let ok = kinds.iter().filter(|&&k| k == 0).count();
+        let statuses = self.verifier.statuses();
+        let checking = self.verifier.running();
+        let ok = statuses.iter().filter(|s| **s == Status::Ok).count();
+        if checking {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new(t.models).strong().size(15.0));
-            ui.label(RichText::new(format!("{ok}/4 {}", t.match_word)).color(if ok == 4 { GREEN } else { AMBER }));
+            ui.label(RichText::new(format!("{ok}/{} {}", MODELS.len(), t.match_word)).color(if ok == MODELS.len() { GREEN } else { AMBER }));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let b = egui::Button::new(RichText::new(format!("{}  {}", ph::ARROWS_CLOCKWISE, t.recheck)).color(BLUE))
                     .fill(SEL)
                     .stroke(Stroke::new(1.0, BLUE));
-                if ui.add(b).on_hover_text(t.recheck_tip).clicked() {
-                    self.rechecked = true;
+                if ui.add_enabled(!checking, b).on_hover_text(t.recheck_tip).clicked() {
+                    self.verifier.start(PathBuf::from(self.cfg.model_dir.trim()));
+                    // A file that just became valid must be picked up by ComfyUI's model list.
+                    if !matches!(self.comfy.state(), comfy::State::Ready { .. } | comfy::State::Starting) {
+                        self.comfy.start(&self.cfg.comfy_dir, Path::new(self.cfg.model_dir.trim()));
+                    }
                 }
             });
         });
@@ -930,41 +1452,56 @@ impl App {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_sized([110.0, 24.0], egui::Label::new(t.model_folder));
-            ui.add(egui::TextEdit::singleline(&mut self.model_dir).desired_width(ui.available_width() - 70.0).font(egui::TextStyle::Monospace));
-            let _ = ui.button(t.open).on_hover_text(t.open_folder_tip);
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.cfg.model_dir).desired_width(ui.available_width() - 130.0).font(egui::TextStyle::Monospace),
+            );
+            if r.lost_focus() {
+                self.apply_dirs();
+            }
+            if ui.button(t.browse).clicked() {
+                if let Some(dir) = rfd::FileDialog::new().set_directory(&self.cfg.model_dir).pick_folder() {
+                    self.cfg.model_dir = dir.display().to_string();
+                    self.apply_dirs();
+                }
+            }
+            if ui.button(t.open).on_hover_text(t.open_folder_tip).clicked() {
+                let dir = PathBuf::from(self.cfg.model_dir.trim());
+                for m in &MODELS {
+                    let _ = std::fs::create_dir_all(dir.join(m.folder));
+                }
+                open_in_explorer(&dir);
+            }
         });
+        ui.label(RichText::new(t.folder_layout).small().color(MUTED));
         ui.add_space(8.0);
-        let files = [
-            ("qwen_image_2.1_int8_convrot.safetensors", "diffusion_models", "7.26 GB"),
-            ("qwen3vl_8b_int8_convrot.safetensors", "text_encoders", "9.35 GB"),
-            ("qwen_image_2.1_vae_bf16.safetensors", "vae", "0.68 GB"),
-            ("birefnet.safetensors", "background_removal", "0.44 GB"),
-        ];
         Frame::new().fill(Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::same(6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            egui::Grid::new("models").striped(true).num_columns(6).spacing([14.0, 8.0]).show(ui, |ui| {
+            egui::Grid::new("models").num_columns(6).spacing([14.0, 8.0]).show(ui, |ui| {
                 for h in ["", t.col_file, t.col_dir, t.col_size, t.col_hash, t.col_source] {
                     ui.label(RichText::new(h).color(MUTED));
                 }
                 ui.end_row();
-                for (i, (file, dir, size)) in files.iter().enumerate() {
-                    let (icon, color) = match kinds[i] {
-                        0 => (ph::CHECK_CIRCLE, GREEN),
-                        1 => (ph::CIRCLE_NOTCH, BLUE),
-                        2 => (ph::CIRCLE_DASHED, AMBER),
-                        _ => (ph::X_CIRCLE, RED),
+                for (i, m) in MODELS.iter().enumerate() {
+                    let (icon, color, text) = match &statuses[i] {
+                        Status::Ok => (ph::CHECK_CIRCLE, GREEN, t.states[0].to_string()),
+                        Status::Checking(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[1].replace("{}", &format!("{:.0}", f * 100.0))),
+                        Status::Missing => (ph::CIRCLE_DASHED, AMBER, t.states[2].to_string()),
+                        Status::Mismatch => (ph::X_CIRCLE, RED, t.states[3].to_string()),
+                        Status::Unchecked => (ph::CIRCLE, MUTED, t.states[4].to_string()),
                     };
                     ui.label(RichText::new(icon).size(17.0).color(color));
                     // Grid columns keep the width of their first layout, so cells must not wrap.
                     ui.vertical(|ui| {
                         ui.set_min_width(300.0);
                         ui.add(egui::Label::new(t.purposes[i]).extend());
-                        ui.add(egui::Label::new(RichText::new(*file).monospace().small().color(MUTED)).extend());
+                        ui.add(egui::Label::new(RichText::new(m.file).monospace().small().color(MUTED)).extend());
                     });
-                    ui.add(egui::Label::new(RichText::new(*dir).monospace().color(MUTED)).extend());
-                    ui.add(egui::Label::new(RichText::new(*size).monospace()).extend());
-                    ui.add(egui::Label::new(RichText::new(t.states[kinds[i]]).color(color)).extend());
-                    let _ = ui.button(format!("{}  {}", ph::LINK, t.source_page));
+                    ui.add(egui::Label::new(RichText::new(m.folder).monospace().color(MUTED)).extend());
+                    ui.add(egui::Label::new(RichText::new(format!("{:.2} GB", m.size as f64 / 1e9)).monospace()).extend());
+                    ui.add(egui::Label::new(RichText::new(text).color(color)).extend()).on_hover_text(m.sha256);
+                    if ui.button(format!("{}  {}", ph::LINK, t.source_page)).on_hover_text(m.source).clicked() {
+                        open_in_explorer(Path::new(m.source));
+                    }
                     ui.end_row();
                 }
             });
@@ -972,33 +1509,68 @@ impl App {
         ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
             ui.label(RichText::new(t.only_safetensors).color(MUTED));
             ui.add_space(12.0);
-            ui.label(RichText::new(t.total).color(MUTED));
+            ui.label(RichText::new(t.total.replace("{}", &format!("{:.1}", models::total_bytes() as f64 / 1e9))).color(MUTED));
         });
     }
 
     fn comfy_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {
+        let state = self.comfy.state();
+        if state == comfy::State::Starting {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        }
         ui.label(RichText::new("ComfyUI").strong().size(15.0));
         ui.label(RichText::new(t.comfy_install).color(MUTED));
         ui.add_space(8.0);
         egui::Grid::new("comfy").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label(t.location);
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.comfy_dir).desired_width(520.0).font(egui::TextStyle::Monospace));
+                let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.comfy_dir).desired_width(520.0).font(egui::TextStyle::Monospace));
+                if r.lost_focus() {
+                    self.apply_dirs();
+                }
                 if ui.button(t.browse).clicked() {
                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        self.comfy_dir = dir.display().to_string();
+                        self.cfg.comfy_dir = dir.display().to_string();
+                        self.apply_dirs();
                     }
                 }
             });
             ui.end_row();
             ui.label(t.state);
-            ui.label(RichText::new(format!("●  {}", t.comfy_state)).color(GREEN));
+            ui.horizontal(|ui| {
+                let (color, text) = match &state {
+                    comfy::State::NotSet => (MUTED, t.comfy_states[0].to_string()),
+                    comfy::State::NotFound => (AMBER, t.comfy_states[1].to_string()),
+                    comfy::State::Starting => (BLUE, t.comfy_states[2].to_string()),
+                    comfy::State::Ready { version } => (GREEN, t.comfy_states[3].replace("{}", version)),
+                    comfy::State::MissingNodes(_) => (RED, t.comfy_states[4].to_string()),
+                    comfy::State::Failed(_) => (RED, t.comfy_states[5].to_string()),
+                };
+                if state == comfy::State::Starting {
+                    ui.add(egui::Spinner::new().size(14.0).color(BLUE));
+                } else {
+                    ui.label(RichText::new("●").color(color));
+                }
+                ui.label(RichText::new(text).color(color));
+                if !self.cfg.comfy_dir.trim().is_empty() && ui.button(format!("{}  {}", ph::ARROWS_CLOCKWISE, t.restart)).on_hover_text(t.restart_tip).clicked() {
+                    self.comfy.start(&self.cfg.comfy_dir, Path::new(self.cfg.model_dir.trim()));
+                    self.applied_dirs = (self.cfg.model_dir.trim().to_string(), self.cfg.comfy_dir.trim().to_string());
+                }
+                if self.comfy.log_path().is_file() && ui.button(format!("{}  {}", ph::FILE_TEXT, t.comfy_log)).clicked() {
+                    open_in_explorer(&self.comfy.log_path());
+                }
+            });
             ui.end_row();
+            if let comfy::State::Failed(e) = &state {
+                ui.label("");
+                ui.add(egui::Label::new(RichText::new(e).monospace().small().color(RED)).wrap());
+                ui.end_row();
+            }
         });
         ui.add_space(8.0);
         ui.separator();
         ui.label(RichText::new(t.gpu_memory).strong());
-        ui.checkbox(&mut self.keep_loaded, t.keep_loaded);
+        ui.checkbox(&mut self.cfg.keep_loaded, t.keep_loaded);
         ui.horizontal(|ui| {
             ui.add_space(24.0);
             ui.add(egui::Label::new(RichText::new(t.keep_loaded_desc).color(MUTED)).wrap());
@@ -1006,22 +1578,9 @@ impl App {
     }
 
     fn log_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {
-        let lines = [
-            ("12:40:02", "INFO", r"App started; launching ComfyUI from D:\ComfyUI_windows_portable"),
-            ("12:40:11", "INFO", "ComfyUI ready (v0.40.0, port 8188)"),
-            ("12:40:11", "INFO", "Model check: 4/4 match"),
-            ("12:41:05", "INFO", "Input VRChat_2026-10-15.png 2160x3840; model resolution 1536"),
-            ("12:41:05", "INFO", "Shading started: light=top-left strength=1.0 scope=subject seed=random"),
-            ("12:41:12", "INFO", "AI: first step after 6.9 s"),
-            ("12:42:03", "INFO", "AI: 25/25 steps done in 58.1 s"),
-            ("12:42:05", "INFO", "Subject mask (BiRefNet) in 1.6 s"),
-            ("12:42:08", "WARN", "5.3% of pixels got brighter; they are not included in the shadow layer"),
-            ("12:42:09", "INFO", "Shadow layer 1152x2048 -> 2160x3840 in 3.2 s"),
-            ("12:42:10", "INFO", "Done in 64.8 s"),
-            ("12:45:31", "ERROR", "Export failed: cannot write to the output folder (access denied)"),
-        ];
-        let filter = [None, Some("INFO"), Some("WARN"), Some("ERROR")][self.log_level];
-        let shown: Vec<_> = lines.iter().filter(|(_, lv, _)| filter.is_none_or(|f| f == *lv)).collect();
+        let (serial, lines) = self.log.snapshot();
+        let filter = [None, Some(Level::Info), Some(Level::Warn), Some(Level::Error)][self.log_level];
+        let shown: Vec<_> = lines.iter().filter(|l| filter.is_none_or(|f| f == l.level)).collect();
         ui.horizontal(|ui| {
             ui.label(RichText::new(t.log).strong().size(15.0));
             ui.add_space(8.0);
@@ -1031,39 +1590,48 @@ impl App {
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let _ = ui.button(t.open_log_folder);
+                if ui.button(t.open_log_folder).clicked() {
+                    open_in_explorer(self.log.dir());
+                }
                 if ui.button(t.copy).on_hover_text(t.copy_tip).clicked() {
-                    let text = shown.iter().map(|(a, b, c)| format!("{a}  {b:<5} {c}")).collect::<Vec<_>>().join("\n");
+                    let text = shown.iter().map(|l| format!("{}  {:<5}  {}", l.time, l.level.tag(), l.text)).collect::<Vec<_>>().join("\n");
                     ui.ctx().copy_text(text);
                 }
             });
         });
         ui.add_space(6.0);
+        let stick = serial != self.log_seen;
+        self.log_seen = serial;
         Frame::new().fill(Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::same(8)).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for (time, level, text) in &shown {
-                    let color = match *level {
-                        "WARN" => AMBER,
-                        "ERROR" => RED,
-                        _ => TEXT,
+            egui::ScrollArea::both().auto_shrink([false, false]).stick_to_bottom(stick).show(ui, |ui| {
+                for l in &shown {
+                    let color = match l.level {
+                        Level::Warn => AMBER,
+                        Level::Error => RED,
+                        Level::Info => TEXT,
                     };
-                    ui.label(RichText::new(format!("{time}  {level:<5}  {text}")).monospace().color(color));
+                    ui.add(egui::Label::new(RichText::new(format!("{}  {:<5}  {}", l.time, l.level.tag(), l.text)).monospace().color(color)).extend());
                 }
             });
         });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let dropped: Vec<_> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        let dropped: Vec<_> =
+            ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if let Some(path) = dropped.first() {
             self.open_path(&ctx, path);
         }
         self.tick(&ctx);
         self.handle_shot(&ctx);
+        if self.verifier.running() || self.comfy.state() == comfy::State::Starting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
 
         let bar = Frame::new().fill(PANEL).inner_margin(Margin::symmetric(6, 4)).stroke(Stroke::new(1.0, LINE));
         let side = Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, LINE));
@@ -1096,11 +1664,16 @@ impl eframe::App for App {
                             }
                         }
                     });
-                egui::CentralPanel::default()
-                    .frame(Frame::new().fill(BG).inner_margin(Margin::same(12)))
-                    .show(ui, |ui| self.settings_body(ui));
+                egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(12))).show(ui, |ui| self.settings_body(ui));
             }
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.cfg.lang = if self.lang == Lang::En { "en" } else { "ja" }.into();
+        self.save_config();
+        self.comfy.stop();
     }
 }
 
@@ -1110,6 +1683,51 @@ impl Button {
     fn icon_text(icon: &str, text: &str) -> egui::Button<'static> {
         egui::Button::new(format!("{icon}  {text}"))
     }
+}
+
+/// Decode an image file, applying its EXIF orientation (as ComfyUI's LoadImage does).
+fn load_image(path: &Path) -> Result<Image8, String> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    Ok(Image8::from_dynamic(&img))
+}
+
+fn max_side(ctx: &egui::Context) -> usize {
+    ctx.input(|i| i.max_texture_side).max(2048)
+}
+
+/// RGBA texture data, downscaled when the GPU cannot hold the full size (display only).
+fn color_image(rgba: &[u8], w: usize, h: usize, max: usize) -> egui::ColorImage {
+    if w.max(h) <= max {
+        return egui::ColorImage::from_rgba_unmultiplied([w, h], rgba);
+    }
+    let k = max as f64 / w.max(h) as f64;
+    let (nw, nh) = (((w as f64 * k).round() as usize).max(1), ((h as f64 * k).round() as usize).max(1));
+    egui::ColorImage::from_rgba_unmultiplied([nw, nh], &resample::resize_rgba(rgba, w, h, nw, nh, Filter::Bilinear))
+}
+
+/// Multiply layer (gray or RGB) as RGBA.
+fn layer_rgba(layer: &[u8], color: bool) -> Vec<u8> {
+    if color {
+        layer.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect()
+    } else {
+        layer.iter().flat_map(|&v| [v, v, v, 255]).collect()
+    }
+}
+
+fn thumbnail(ctx: &egui::Context, rgba: &[u8], w: usize, h: usize) -> TextureHandle {
+    let k = 132.0 / w.max(h) as f64;
+    let (nw, nh) = (((w as f64 * k).round() as usize).max(1), ((h as f64 * k).round() as usize).max(1));
+    let small = resample::resize_rgba(rgba, w, h, nw, nh, Filter::Lanczos);
+    ctx.load_texture("thumb", egui::ColorImage::from_rgba_unmultiplied([nw, nh], &small), egui::TextureOptions::LINEAR)
+}
+
+fn open_in_explorer(target: &Path) {
+    let _ = std::process::Command::new("explorer").arg(target).spawn();
 }
 
 fn clock(sec: f64) -> String {
