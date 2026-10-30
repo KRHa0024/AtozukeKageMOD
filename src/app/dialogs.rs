@@ -86,7 +86,8 @@ impl App {
                         self.cfg.out_dir = dir.display().to_string();
                     }
                 }
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.out_dir).desired_width(ui.available_width()).font(egui::TextStyle::Monospace));
+                let field = ui.available_width();
+                ui.add(egui::TextEdit::singleline(&mut self.cfg.out_dir).desired_width(field).min_size(Vec2::new(field, row.y)).vertical_align(Align::Center).font(egui::TextStyle::Monospace));
             });
             let names = export::planned_names(&stem, self.cfg.export_targets, format);
             ui.add(egui::Label::new(RichText::new(names.join("  ")).small().color(MUTED)).wrap());

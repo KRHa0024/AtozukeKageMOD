@@ -26,6 +26,33 @@ const HEADER_HEIGHT: f32 = 20.0;
 const ROW_HEIGHT: f32 = 36.0;
 const MIN_FILE_COLUMN: f32 = 120.0;
 const ROW_MARGIN: i8 = 8;
+/// Path fields and the buttons next to them.
+const FIELD_HEIGHT: f32 = 28.0;
+const COMFY_FIELD_WIDTH: f32 = 560.0;
+
+/// A path field and its folder button on one line, with the same height. True when the path was changed.
+fn directory_field(ui: &mut egui::Ui, path: &mut String, width: f32, choose: &str) -> bool {
+    let mut changed = false;
+    ui.allocate_ui_with_layout(egui::vec2(width, FIELD_HEIGHT), Layout::left_to_right(Align::Center), |ui| {
+        let field = width - FIELD_HEIGHT - ui.spacing().item_spacing.x;
+        let edit = egui::TextEdit::singleline(path)
+            .desired_width(field)
+            .min_size(egui::vec2(field, FIELD_HEIGHT))
+            .vertical_align(Align::Center)
+            .font(egui::TextStyle::Monospace);
+        changed = ui.add(edit).lost_focus();
+        // The icon's line height plus the usual padding would make the button taller than the field.
+        ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+        let button = egui::Button::new(RichText::new(ph::FOLDER_OPEN).size(SIZE_ICON));
+        if ui.add_sized([FIELD_HEIGHT, FIELD_HEIGHT], button).on_hover_text(choose).clicked() {
+            if let Some(dir) = rfd::FileDialog::new().set_title(choose).set_directory(path.trim()).pick_folder() {
+                *path = dir.display().to_string();
+                changed = true;
+            }
+        }
+    });
+    changed
+}
 
 /// One line of the model list: file (takes what is left), size, state, actions.
 fn model_columns(
@@ -148,17 +175,11 @@ impl App {
         });
         ui.add(egui::Label::new(t.models_note).wrap());
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), FIELD_HEIGHT), Layout::left_to_right(Align::Center), |ui| {
+            ui.set_height(FIELD_HEIGHT);
             ui.label(t.model_folder);
-            let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.model_dir).desired_width(ui.available_width() - 40.0).font(egui::TextStyle::Monospace));
-            if r.lost_focus() {
+            if directory_field(ui, &mut self.cfg.model_dir, ui.available_width(), t.choose_model_dir) {
                 self.apply_dirs();
-            }
-            if ui.button(RichText::new(ph::FOLDER_OPEN).size(SIZE_ICON)).on_hover_text(t.choose_model_dir).clicked() {
-                if let Some(dir) = rfd::FileDialog::new().set_title(t.choose_model_dir).set_directory(self.cfg.model_dir.trim()).pick_folder() {
-                    self.cfg.model_dir = dir.display().to_string();
-                    self.apply_dirs();
-                }
             }
         });
         ui.add_space(12.0);
@@ -274,18 +295,9 @@ impl App {
         ui.add_space(8.0);
         egui::Grid::new("comfy").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label(t.location);
-            ui.horizontal(|ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.comfy_dir).desired_width(520.0).font(egui::TextStyle::Monospace));
-                if r.lost_focus() {
-                    self.apply_dirs();
-                }
-                if ui.button(RichText::new(ph::FOLDER_OPEN).size(SIZE_ICON)).on_hover_text(t.choose_comfy_dir).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().set_title(t.choose_comfy_dir).pick_folder() {
-                        self.cfg.comfy_dir = dir.display().to_string();
-                        self.apply_dirs();
-                    }
-                }
-            });
+            if directory_field(ui, &mut self.cfg.comfy_dir, COMFY_FIELD_WIDTH, t.choose_comfy_dir) {
+                self.apply_dirs();
+            }
             ui.end_row();
             ui.label(t.state);
             ui.horizontal(|ui| {
