@@ -1,12 +1,20 @@
 //! Saving the results: PNG (lossless, compression level), JPEG / WebP (quality) and layered PSD.
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use image::ImageEncoder;
 
-use crate::blend::Mode;
+use crate::blend::{self, Mode, View, AI, ORIGINAL, SHADOW};
 use crate::resample::{self, Filter};
+use crate::shading::{Image8, Layers};
+
+/// WebP's limit per side.
+const WEBP_MAX_SIDE: usize = 16383;
+const JPEG_MAX_SIDE: usize = 65535;
+const PSD_MAX_SIDE: usize = 30000;
+/// WebP at this quality is written lossless.
+const WEBP_LOSSLESS_QUALITY: u8 = 100;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
@@ -27,6 +35,13 @@ impl Format {
             Format::Psd => "psd",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Encoding {
+    pub format: Format,
+    pub png_level: u8,
+    pub quality: u8,
 }
 
 /// An 8-bit image to save: 1 (gray), 3 (RGB) or 4 (RGBA) channels.
@@ -72,48 +87,225 @@ pub fn unique_path(dir: &Path, stem: &str, suffix: &str, ext: &str) -> PathBuf {
     p
 }
 
-pub fn save(px: &Pixels, path: &Path, format: Format, png_level: u8, quality: u8) -> Result<(), String> {
+fn check_size(w: usize, h: usize, max: usize, format: &str) -> Result<(), String> {
+    if w.max(h) > max {
+        return Err(format!("{format} supports up to {max} px per side ({w}x{h})"));
+    }
+    Ok(())
+}
+
+/// The file's bytes for a PNG, JPEG or WebP. `icc` is embedded when given (RGB profiles: not for gray pixels).
+pub fn encode(px: &Pixels, enc: &Encoding, icc: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let (w, h) = (px.w as u32, px.h as u32);
-    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut out = BufWriter::new(file);
-    match format {
+    let quality = enc.quality.clamp(1, 100);
+    let mut out = Vec::new();
+    match enc.format {
         Format::Png => {
             use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-            let level = match png_level {
+            let level = match enc.png_level {
                 0 => CompressionType::Uncompressed,
                 l => CompressionType::Level(l.min(9)),
             };
-            let enc = PngEncoder::new_with_quality(&mut out, level, FilterType::Adaptive);
+            let mut encoder = PngEncoder::new_with_quality(&mut out, level, FilterType::Adaptive);
+            if let Some(icc) = icc {
+                encoder.set_icc_profile(icc.to_vec()).map_err(|e| e.to_string())?;
+            }
             let (data, ct) = match px.channels {
                 1 => (px.data.to_vec(), image::ExtendedColorType::L8),
                 3 => (px.data.to_vec(), image::ExtendedColorType::Rgb8),
                 _ if px.opaque() => (px.rgb(), image::ExtendedColorType::Rgb8),
                 _ => (px.data.to_vec(), image::ExtendedColorType::Rgba8),
             };
-            enc.write_image(&data, w, h, ct).map_err(|e| e.to_string())?;
+            encoder.write_image(&data, w, h, ct).map_err(|e| e.to_string())?;
         }
         Format::Jpeg => {
-            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100));
+            check_size(px.w, px.h, JPEG_MAX_SIDE, "JPEG")?;
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+            if let Some(icc) = icc {
+                encoder.set_icc_profile(icc.to_vec()).map_err(|e| e.to_string())?;
+            }
             let (data, ct) = if px.channels == 1 {
                 (px.data.to_vec(), image::ExtendedColorType::L8)
             } else {
                 (px.rgb(), image::ExtendedColorType::Rgb8)
             };
-            enc.write_image(&data, w, h, ct).map_err(|e| e.to_string())?;
+            encoder.write_image(&data, w, h, ct).map_err(|e| e.to_string())?;
         }
         Format::Webp => {
-            let encoded = if px.opaque() {
-                let rgb = px.rgb();
-                webp::Encoder::from_rgb(&rgb, w, h).encode(quality.clamp(1, 100) as f32).to_vec()
+            check_size(px.w, px.h, WEBP_MAX_SIDE, "WebP")?;
+            let opaque = px.opaque();
+            let lossless = quality >= WEBP_LOSSLESS_QUALITY;
+            let (rgb, rgba);
+            let encoder = if opaque {
+                rgb = px.rgb();
+                webp::Encoder::from_rgb(&rgb, w, h)
             } else {
-                let rgba = px.rgba();
-                webp::Encoder::from_rgba(&rgba, w, h).encode(quality.clamp(1, 100) as f32).to_vec()
+                rgba = px.rgba();
+                webp::Encoder::from_rgba(&rgba, w, h)
             };
-            out.write_all(&encoded).map_err(|e| e.to_string())?;
+            let encoded = encoder.encode_simple(lossless, quality as f32).map_err(|e| format!("WebP: {e:?}"))?.to_vec();
+            out = match icc {
+                Some(icc) => webp_with_icc(&encoded, icc, px.w, px.h, !opaque)?,
+                None => encoded,
+            };
         }
         Format::Psd => return Err("use save_psd".into()),
     }
-    out.flush().map_err(|e| e.to_string())
+    Ok(out)
+}
+
+pub fn save(px: &Pixels, path: &Path, enc: &Encoding, icc: Option<&[u8]>) -> Result<(), String> {
+    write_atomic(path, &encode(px, enc, icc)?)
+}
+
+/// Through a temporary file, so a failed write never leaves a partial image.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    let tmp = path.with_file_name(name);
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn webp_chunk(out: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(fourcc);
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(data);
+    if data.len() % 2 != 0 {
+        out.push(0);
+    }
+}
+
+/// Add an ICCP chunk to a WebP file (libwebp's simple encoder writes none): the extended header goes first, then the
+/// profile, then the image chunks unchanged.
+fn webp_with_icc(file: &[u8], icc: &[u8], w: usize, h: usize, alpha: bool) -> Result<Vec<u8>, String> {
+    const ICC_FLAG: u8 = 0x20;
+    const ALPHA_FLAG: u8 = 0x10;
+    if file.len() < 20 || &file[..4] != b"RIFF" || &file[8..12] != b"WEBP" {
+        return Err("WebP: unexpected encoder output".into());
+    }
+    let mut body = Vec::with_capacity(file.len() + icc.len() + 32);
+    let chunks = &file[12..];
+    if &chunks[..4] == b"VP8X" {
+        let mut header = chunks[8..18].to_vec();
+        header[0] |= ICC_FLAG;
+        webp_chunk(&mut body, b"VP8X", &header);
+        webp_chunk(&mut body, b"ICCP", icc);
+        body.extend_from_slice(&chunks[18..]);
+    } else {
+        let mut header = vec![ICC_FLAG | if alpha { ALPHA_FLAG } else { 0 }, 0, 0, 0];
+        header.extend_from_slice(&((w - 1) as u32).to_le_bytes()[..3]);
+        header.extend_from_slice(&((h - 1) as u32).to_le_bytes()[..3]);
+        webp_chunk(&mut body, b"VP8X", &header);
+        webp_chunk(&mut body, b"ICCP", icc);
+        body.extend_from_slice(chunks);
+    }
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(b"WEBP");
+    out.extend(body);
+    Ok(out)
+}
+
+/// One export: the layer panel's state and what to write.
+pub struct Job<'a> {
+    pub original: &'a Image8,
+    /// AI output (model resolution).
+    pub shaded: &'a Image8,
+    /// AI output at the original's size.
+    pub ai_full: &'a [u8],
+    pub layers: &'a Layers,
+    pub view: View,
+    /// Shadow layer, AI output, composite (PSD always holds all three).
+    pub targets: [bool; 3],
+    pub encoding: Encoding,
+    pub dir: &'a Path,
+    pub stem: &'a str,
+    /// Layer names in the PSD (shadow, AI output, original).
+    pub names: [&'a str; 3],
+}
+
+/// Written files, and the error that stopped the rest.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub written: Vec<PathBuf>,
+    pub error: Option<String>,
+}
+
+/// File names a job writes in an empty directory (for showing them before exporting).
+pub fn planned_names(stem: &str, targets: [bool; 3], format: Format) -> Vec<String> {
+    if format == Format::Psd {
+        return vec![format!("{stem}_kage.psd")];
+    }
+    ["shadow", "ai", "shaded"].iter().zip(targets).filter(|(_, on)| *on).map(|(s, _)| format!("{stem}_{s}.{}", format.ext())).collect()
+}
+
+pub fn run_job(job: &Job) -> Outcome {
+    let mut out = Outcome::default();
+    if let Err(e) = write_files(job, &mut out.written) {
+        out.error = Some(e);
+    }
+    out
+}
+
+fn write_files(job: &Job, written: &mut Vec<PathBuf>) -> Result<(), String> {
+    let Job { original, shaded, ai_full, layers, view, targets, encoding, dir, stem, names } = job;
+    let (w, h) = (layers.w, layers.h);
+    let format = encoding.format;
+    let icc = original.icc.as_ref().map(|p| p.as_slice());
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if format == Format::Psd {
+        let psd_layers = [
+            PsdLayer { name: names[ORIGINAL], rgba: original.rgba.clone(), mode: None, opacity: 1.0, visible: view.visible[ORIGINAL] },
+            PsdLayer { name: names[AI], rgba: ai_full.to_vec(), mode: None, opacity: view.opacity[AI], visible: view.visible[AI] },
+            PsdLayer {
+                name: names[SHADOW],
+                rgba: blend::shadow_rgba(layers, view.mode, &original.rgba),
+                mode: Some(view.mode),
+                opacity: view.opacity[SHADOW],
+                visible: view.visible[SHADOW],
+            },
+        ];
+        let composite = blend::flatten_view(original, ai_full, layers, view);
+        let path = unique_path(dir, stem, "kage", "psd");
+        save_psd(&path, w, h, &psd_layers, &composite, icc)?;
+        written.push(path);
+        return Ok(());
+    }
+    let ext = format.ext();
+    if targets[0] {
+        let path = unique_path(dir, stem, "shadow", ext);
+        if view.mode == Mode::Normal || !original.alpha_is_opaque() {
+            let rgba = blend::shadow_rgba(layers, view.mode, &original.rgba);
+            save(&Pixels { w, h, channels: 4, data: &rgba }, &path, encoding, None)?;
+        } else {
+            let channels = if layers.color { 3 } else { 1 };
+            save(&Pixels { w, h, channels, data: &layers.multiply }, &path, encoding, None)?;
+        }
+        written.push(path);
+    }
+    if targets[1] {
+        let path = unique_path(dir, stem, "ai", ext);
+        save(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, &path, encoding, icc)?;
+        written.push(path);
+    }
+    if targets[2] {
+        let path = unique_path(dir, stem, "shaded", ext);
+        let composite = blend::flatten_view(original, ai_full, layers, view);
+        save(&Pixels { w, h, channels: 4, data: &composite }, &path, encoding, icc)?;
+        written.push(path);
+    }
+    Ok(())
 }
 
 pub struct PsdLayer<'a> {
@@ -125,11 +317,10 @@ pub struct PsdLayer<'a> {
     pub visible: bool,
 }
 
-/// Layered PSD (8-bit RGB, RLE). `merged` is the flattened result shown by viewers without layer support.
-pub fn save_psd(path: &Path, w: usize, h: usize, layers: &[PsdLayer], merged: &[u8]) -> Result<(), String> {
-    if w > 30000 || h > 30000 {
-        return Err("PSD supports up to 30000 px per side".into());
-    }
+/// Layered PSD (8-bit RGB, RLE). `merged` is the flattened result shown by viewers without layer support (over white,
+/// as it has no alpha).
+pub fn save_psd(path: &Path, w: usize, h: usize, layers: &[PsdLayer], merged: &[u8], icc: Option<&[u8]>) -> Result<(), String> {
+    check_size(w, h, PSD_MAX_SIDE, "PSD")?;
     let mut f = Vec::<u8>::new();
     f.extend_from_slice(b"8BPS");
     be16(&mut f, 1);
@@ -140,7 +331,19 @@ pub fn save_psd(path: &Path, w: usize, h: usize, layers: &[PsdLayer], merged: &[
     be16(&mut f, 8);
     be16(&mut f, 3); // RGB
     be32(&mut f, 0); // color mode data
-    be32(&mut f, 0); // image resources
+    let mut resources = Vec::new();
+    if let Some(icc) = icc {
+        resources.extend_from_slice(b"8BIM");
+        be16(&mut resources, 1039); // ICC profile
+        be16(&mut resources, 0); // empty name
+        be32(&mut resources, icc.len() as u32);
+        resources.extend_from_slice(icc);
+        if icc.len() % 2 != 0 {
+            resources.push(0);
+        }
+    }
+    be32(&mut f, resources.len() as u32);
+    f.extend(resources);
 
     // Layer records and channel data.
     let mut records = Vec::new();
@@ -219,7 +422,8 @@ pub fn save_psd(path: &Path, w: usize, h: usize, layers: &[PsdLayer], merged: &[
 
     // Merged image: RLE, all row byte counts first, then the rows of R, G, B.
     be16(&mut f, 1);
-    let planes: Vec<Vec<u8>> = (0..3).map(|c| merged.iter().skip(c).step_by(4).copied().collect()).collect();
+    let flat = resample::over_white(merged);
+    let planes: Vec<Vec<u8>> = (0..3).map(|c| flat.iter().skip(c).step_by(3).copied().collect()).collect();
     let mut counts = Vec::new();
     let mut rows = Vec::new();
     for plane in &planes {
@@ -231,7 +435,7 @@ pub fn save_psd(path: &Path, w: usize, h: usize, layers: &[PsdLayer], merged: &[
     }
     f.extend(counts);
     f.extend(rows);
-    std::fs::write(path, f).map_err(|e| format!("{}: {e}", path.display()))
+    write_atomic(path, &f)
 }
 
 /// Canvas-sized RGBA from any image (resized with Lanczos when needed).

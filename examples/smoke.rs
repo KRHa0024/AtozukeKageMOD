@@ -62,10 +62,12 @@ fn main() {
             Ok(Event::WaitingForComfy) => println!("waiting for ComfyUI"),
             Ok(Event::Done(r)) => {
                 std::fs::create_dir_all(&out).unwrap();
-                let l = &r.layers;
+                let l = &r.solved.layers;
                 let ct = if l.color { image::ColorType::Rgb8 } else { image::ColorType::L8 };
+                let view = kage::blend::View { visible: [true, false, true], opacity: [1.0; 3], mode: kage::blend::Mode::Multiply };
+                let composite = kage::blend::flatten_view(&r.original, &r.ai_full, l, &view);
                 image::save_buffer(out.join("multiply.png"), &l.multiply, l.w as u32, l.h as u32, ct).unwrap();
-                image::save_buffer(out.join("preview.png"), &l.preview, l.w as u32, l.h as u32, image::ColorType::Rgba8).unwrap();
+                image::save_buffer(out.join("composite.png"), &composite, l.w as u32, l.h as u32, image::ColorType::Rgba8).unwrap();
                 image::save_buffer(out.join("ai.png"), &r.shaded.rgba, r.shaded.w as u32, r.shaded.h as u32, image::ColorType::Rgba8).unwrap();
                 if let Some(m) = &r.mask {
                     image::save_buffer(out.join("mask.png"), &m.0, m.1 as u32, m.2 as u32, image::ColorType::L8).unwrap();
@@ -76,7 +78,7 @@ fn main() {
             }
             Ok(Event::Failed(e)) => {
                 flush(&log);
-                println!("FAILED: {e}");
+                println!("FAILED: {}", e.detail());
                 break;
             }
             Ok(Event::Cancelled) => break,

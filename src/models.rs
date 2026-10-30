@@ -101,6 +101,17 @@ pub fn model_path(dir: &Path, m: &ModelFile) -> PathBuf {
     dir.join(m.folder).join(m.file)
 }
 
+/// A free name next to `dest` for a file that is being replaced.
+fn aside_path(dest: &Path) -> PathBuf {
+    let mut path = dest.with_extension("safetensors.mismatch");
+    let mut n = 2;
+    while path.exists() {
+        path = dest.with_extension(format!("safetensors.mismatch{n}"));
+        n += 1;
+    }
+    path
+}
+
 struct State {
     status: [Status; 4],
     notes: [Option<Note>; 4],
@@ -315,30 +326,47 @@ impl Verifier {
             (Ok(a), Ok(b)) => a == b,
             _ => false,
         };
-        if !same {
+        let mut cache = self.load_cache();
+        let key = dest.display().to_string();
+        // A hard link canonicalizes to its own path, so the verified copy is recognized from the record.
+        let verified = stat(&dest).is_some_and(|(s, t)| cache.get(&key).is_some_and(|c| c.size == s && c.mtime == t && c.sha256 == m.sha256));
+        if !same && !verified {
             let folder = dest.parent().expect("model folder");
             std::fs::create_dir_all(folder).map_err(|e| fail(format!("{}: {e}", folder.display())))?;
-            if dest.exists() {
-                // Keep whatever was there (it did not match) instead of deleting it.
-                let aside = dest.with_extension("safetensors.mismatch");
-                std::fs::rename(&dest, &aside).map_err(|e| fail(format!("{}: {e}", dest.display())))?;
+            // Keep whatever was there (it did not match) instead of deleting it.
+            let aside = dest.exists().then(|| aside_path(&dest));
+            if let Some(aside) = &aside {
+                std::fs::rename(&dest, aside).map_err(|e| fail(format!("{}: {e}", dest.display())))?;
                 self.log.warn(format!("Moved the previous {} aside to {}", m.file, aside.display()));
             }
-            if std::fs::hard_link(src, &dest).is_ok() {
-                self.log.info(format!("Model {}: linked {} -> {}", m.file, src.display(), dest.display()));
-            } else {
-                self.copy(i, src, &dest, size, gen).map_err(|e| match e {
-                    Some(e) => fail(format!("copy to {}: {e}", dest.display())),
-                    None => None,
-                })?;
-                self.log.info(format!("Model {}: copied {} -> {}", m.file, src.display(), dest.display()));
+            if let Err(e) = self.put(i, src, &dest, size, gen) {
+                if let Some(aside) = &aside {
+                    let _ = std::fs::rename(aside, &dest);
+                }
+                return Err(e.and_then(|e| fail(format!("copy to {}: {e}", dest.display()))));
             }
         }
         let (dsize, mtime) = stat(&dest).ok_or_else(|| fail(format!("cannot read {}", dest.display())))?;
-        let mut cache = self.load_cache();
-        cache.insert(dest.display().to_string(), Seen { size: dsize, mtime, sha256: sha });
+        cache.insert(key, Seen { size: dsize, mtime, sha256: sha });
         let _ = std::fs::write(&self.cache_path, serde_json::to_vec_pretty(&cache).unwrap_or_default());
         self.log.info(format!("Model {}: match", m.file));
+        Ok(())
+    }
+
+    /// Hard link when the drive allows it, otherwise a copy that is verified again: only a matching file may stay.
+    fn put(&self, i: usize, src: &Path, dest: &Path, size: u64, gen: u64) -> Result<(), Option<String>> {
+        let m = &MODELS[i];
+        if std::fs::hard_link(src, dest).is_ok() {
+            self.log.info(format!("Model {}: linked {} -> {}", m.file, src.display(), dest.display()));
+            return Ok(());
+        }
+        self.copy(i, src, dest, size, gen)?;
+        self.set(i, Status::Checking(0.0));
+        if self.hash(dest, i, size, gen).as_deref() != Some(m.sha256) {
+            let _ = std::fs::remove_file(dest);
+            return if self.cancelled(gen) { Err(None) } else { Err(Some("the copy does not match".into())) };
+        }
+        self.log.info(format!("Model {}: copied {} -> {}", m.file, src.display(), dest.display()));
         Ok(())
     }
 

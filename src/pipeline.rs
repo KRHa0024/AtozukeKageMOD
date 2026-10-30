@@ -11,9 +11,12 @@ use std::time::Instant;
 
 use serde_json::{json, Value};
 
-use crate::comfy::{self, Comfy, RunError};
+use crate::blend::{self, Mode};
+use crate::comfy::{self, Comfy, Failure, RunError};
+use crate::export::{self, Pixels};
 use crate::log::Log;
 use crate::models::{Verifier, MODELS};
+use crate::resample::{self, Filter};
 use crate::shading::{self, Image8, Layers, Options};
 
 /// Tuned on VRChat / anime renders: asking for "natural, only darken" made the model grade the whole image (pink
@@ -24,6 +27,9 @@ const LARGE_SOURCE_PIXELS: usize = 2_500_000;
 const LARGE_RESOLUTION: u32 = 1536;
 const DEFAULT_RESOLUTION: u32 = 1024;
 const STEPS: u32 = 25;
+
+/// Longest side of the layer and history thumbnails, in pixels (they are drawn at about a third of that).
+const THUMB_SIDE: f64 = 132.0;
 
 /// Light direction cells (3x3 grid, index 4 = match the image's own light).
 const LIGHT_FROM: [&str; 9] =
@@ -75,6 +81,28 @@ pub struct Request {
     pub keep_loaded: bool,
 }
 
+/// Small RGBA image, made off the UI thread.
+pub struct Thumb {
+    pub w: usize,
+    pub h: usize,
+    pub rgba: Vec<u8>,
+}
+
+/// Fit an RGBA image into the thumbnail size.
+pub fn thumbnail(rgba: &[u8], w: usize, h: usize) -> Thumb {
+    let k = THUMB_SIDE / w.max(h) as f64;
+    let (nw, nh) = (((w as f64 * k).round() as usize).max(1), ((h as f64 * k).round() as usize).max(1));
+    Thumb { w: nw, h: nh, rgba: resample::resize_rgba(rgba, w, h, nw, nh, Filter::Lanczos) }
+}
+
+/// A solved shadow layer with what the UI shows of it.
+pub struct Solved {
+    pub layers: Arc<Layers>,
+    /// original x layer, for the history list.
+    pub shaded_thumb: Thumb,
+    pub shadow_thumb: Thumb,
+}
+
 pub struct RunResult {
     pub original: Arc<Image8>,
     pub name: String,
@@ -82,9 +110,13 @@ pub struct RunResult {
     pub extracted: bool,
     /// AI output (model resolution) or the given shaded image.
     pub shaded: Arc<Image8>,
-    /// Blurred subject mask (None when the background is shaded too).
+    /// The same at the original's size.
+    pub ai_full: Arc<Vec<u8>>,
+    /// Blurred subject mask (None when no run computed one yet).
     pub mask: Option<Arc<(Vec<u8>, usize, usize)>>,
-    pub layers: Layers,
+    pub solved: Solved,
+    pub ai_thumb: Thumb,
+    pub original_thumb: Thumb,
     pub seconds: f32,
 }
 
@@ -94,7 +126,7 @@ pub enum Event {
     Stage(usize),
     Steps(u32, u32),
     Done(Box<RunResult>),
-    Failed(String),
+    Failed(Failure),
     Cancelled,
 }
 
@@ -123,9 +155,9 @@ pub fn spawn(req: Request, ctx: Ctx) {
                 ctx.log.info("Stopped by the user");
                 ctx.send(Event::Cancelled)
             }
-            Err(RunError::Failed(msg)) => {
-                ctx.log.error(format!("Run failed: {msg}"));
-                ctx.send(Event::Failed(msg))
+            Err(RunError::Failed(failure)) => {
+                ctx.log.error(format!("Run failed: {}", failure.detail()));
+                ctx.send(Event::Failed(failure))
             }
         }
         if !req.keep_loaded {
@@ -155,13 +187,9 @@ fn wait_for_comfy(ctx: &Ctx) -> Result<(), RunError> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            comfy::State::NotSet | comfy::State::NotFound => {
-                return Err(RunError::Failed("ComfyUI is not set up (Settings > ComfyUI)".into()))
-            }
-            comfy::State::MissingNodes(n) => {
-                return Err(RunError::Failed(format!("ComfyUI is too old (missing {}); update it", n.join(", "))))
-            }
-            comfy::State::Failed(e) => return Err(RunError::Failed(format!("ComfyUI is not running: {e}"))),
+            comfy::State::NotSet | comfy::State::NotFound => return Err(Failure::NotSetUp.into()),
+            comfy::State::MissingNodes(n) => return Err(Failure::TooOld(n).into()),
+            comfy::State::Failed(e) => return Err(Failure::NotRunning(e).into()),
         }
     }
 }
@@ -172,14 +200,14 @@ fn run(req: &Request, ctx: &Ctx, started: Instant) -> Result<RunResult, RunError
     let needs_comfy = req.shaded.is_none() || !p.background;
     if needs_comfy {
         if !ctx.verifier.still_valid(&req.model_dir) {
-            return Err(RunError::Failed("the model files are missing or not verified (Settings > Models)".into()));
+            return Err(Failure::ModelsInvalid.into());
         }
         wait_for_comfy(ctx)?;
     }
-    let input_name = format!("kage_{}_{:08x}.png", crate::log::stamp(), comfy::random_u64() as u32);
+    let input_name = format!("{}{}_{:08x}.png", comfy::INPUT_PREFIX, crate::log::stamp(), comfy::random_u64() as u32);
     let input_path = ctx.comfy.input_dir().join(&input_name);
     if needs_comfy {
-        write_png(&req.original, &input_path).map_err(|e| RunError::Failed(format!("could not write the input: {e}")))?;
+        write_png(&req.original, &input_path).map_err(|e| Failure::Other(format!("could not write the input: {e}")))?;
     }
     let _cleanup = Cleanup(vec![input_path.clone()]);
 
@@ -229,19 +257,24 @@ fn run(req: &Request, ctx: &Ctx, started: Instant) -> Result<RunResult, RunError
         ctx.send(Event::Stage(1));
         let t0 = Instant::now();
         let files = ctx.comfy.run(&mask_graph(&input_name), "9", &ctx.cancel, |_, _| {})?;
-        let cutout = image::open(&files[0]).map_err(|e| RunError::Failed(format!("subject mask: {e}")))?;
+        let cutout = image::open(&files[0]);
         for f in &files {
             let _ = std::fs::remove_file(f);
         }
+        let cutout = cutout.map_err(|e| Failure::Other(format!("subject mask: {e}")))?;
         ctx.log.info(format!("Subject mask (BiRefNet) in {:.1} s", t0.elapsed().as_secs_f32()));
         Some(Arc::new(shading::subject_mask(&cutout)))
     };
     cancelled(ctx)?;
 
     ctx.send(Event::Stage(2));
-    let layers = solve(&req.original, &shaded, mask.as_deref(), p, &ctx.log);
+    let solved = solve(&req.original, &shaded, mask.as_deref(), p, &ctx.log);
     cancelled(ctx)?;
     ctx.send(Event::Stage(3));
+    let (w, h) = (solved.layers.w, solved.layers.h);
+    let ai_full = export::to_canvas_rgba(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, w, h);
+    let ai_thumb = thumbnail(&shaded.rgba, shaded.w, shaded.h);
+    let original_thumb = thumbnail(&req.original.rgba, w, h);
     let seconds = started.elapsed().as_secs_f32();
     ctx.log.info(format!("Done in {seconds:.1} s"));
     Ok(RunResult {
@@ -250,17 +283,21 @@ fn run(req: &Request, ctx: &Ctx, started: Instant) -> Result<RunResult, RunError
         params: p.clone(),
         extracted: req.shaded.is_some(),
         shaded,
+        ai_full: Arc::new(ai_full),
         mask,
-        layers,
+        solved,
+        ai_thumb,
+        original_thumb,
         seconds,
     })
 }
 
-/// Solve (or re-solve, after the strength / color / smoothing changed) the shadow layer.
-pub fn solve(original: &Image8, shaded: &Image8, mask: Option<&(Vec<u8>, usize, usize)>, p: &Params, log: &Log) -> Layers {
+/// Solve (or re-solve, after the strength / color / smoothing changed) the shadow layer. With the background shaded
+/// the subject mask is not applied.
+pub fn solve(original: &Image8, shaded: &Image8, mask: Option<&(Vec<u8>, usize, usize)>, p: &Params, log: &Log) -> Solved {
     let t0 = Instant::now();
-    let m = mask.map(|(px, w, h)| (px.as_slice(), *w, *h));
-    let layers = shading::shadow_layers(original, shaded, m, &p.options());
+    let m = mask.filter(|_| !p.background).map(|(px, w, h)| (px.as_slice(), *w, *h));
+    let mut layers = shading::shadow_layers(original, shaded, m, &p.options());
     let s = &layers.stats;
     if s.brightened_fraction > 0.02 {
         log.warn(format!(
@@ -278,11 +315,15 @@ pub fn solve(original: &Image8, shaded: &Image8, mask: Option<&(Vec<u8>, usize, 
         s.mean_darkening,
         s.reconstruction_error
     ));
-    layers
+    let shaded_thumb = thumbnail(&layers.preview, layers.w, layers.h);
+    let shadow_thumb = thumbnail(&blend::shadow_rgba(&layers, Mode::Multiply, &original.rgba), layers.w, layers.h);
+    // Only the thumbnail needs it; history keeps many results.
+    layers.preview = Vec::new();
+    Solved { layers: Arc::new(layers), shaded_thumb, shadow_thumb }
 }
 
 /// Qwen-Image 2.1 instruction edit (workflows/edit/qwen_image_2_1_edit.json without the unused reference images).
-fn shade_graph(image: &str, prompt: &str, resolution: u32, seed: u64) -> Value {
+pub fn shade_graph(image: &str, prompt: &str, resolution: u32, seed: u64) -> Value {
     json!({
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": MODELS[0].file, "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": MODELS[1].file, "type": "qwen_image", "device": "default"}},
@@ -303,7 +344,7 @@ fn shade_graph(image: &str, prompt: &str, resolution: u32, seed: u64) -> Value {
 }
 
 /// BiRefNet background removal (workflows/utilities/remove_background_birefnet.json); alpha = subject.
-fn mask_graph(image: &str) -> Value {
+pub fn mask_graph(image: &str) -> Value {
     json!({
         "1": {"class_type": "LoadImage", "inputs": {"image": image}},
         "2": {"class_type": "LoadBackgroundRemovalModel", "inputs": {"bg_removal_name": MODELS[3].file}},
@@ -315,10 +356,11 @@ fn mask_graph(image: &str) -> Value {
 }
 
 fn load_output(files: &[PathBuf]) -> Result<Image8, RunError> {
-    let img = image::open(&files[0]).map_err(|e| RunError::Failed(format!("AI output: {e}")))?;
+    let img = image::open(&files[0]);
     for f in files {
         let _ = std::fs::remove_file(f);
     }
+    let img = img.map_err(|e| Failure::Other(format!("AI output: {e}")))?;
     Ok(Image8::from_dynamic(&img))
 }
 

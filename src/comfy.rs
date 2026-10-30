@@ -3,7 +3,6 @@
 //!
 //! The process is put in a Windows job object that kills it when the app exits, even on a crash.
 
-use std::io::Read;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,6 +17,10 @@ use crate::log::Log;
 /// Core nodes the workflows need (ComfyUI 0.40 or newer).
 pub const REQUIRED_NODES: [&str; 4] = ["QwenImage21Cache", "TextEncodeQwenImage21", "LoadBackgroundRemovalModel", "RemoveBackground"];
 const START_TIMEOUT: Duration = Duration::from_secs(300);
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Input images are named with this prefix, outputs go to this sub-directory; both are cleaned at the next start.
+pub const INPUT_PREFIX: &str = "kage_";
+const OUTPUT_PREFIX_DIR: &str = "kage";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
@@ -110,11 +113,41 @@ impl Comfy {
 
     pub fn stop(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        let proc = self.inner.lock().unwrap().proc.take();
-        if let Some(mut p) = proc {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+        if self.kill() {
             self.log.info("ComfyUI stopped");
+        }
+    }
+
+    fn kill(&self) -> bool {
+        let proc = self.inner.lock().unwrap().proc.take();
+        let Some(mut p) = proc else { return false };
+        let _ = p.child.kill();
+        let _ = p.child.wait();
+        true
+    }
+
+    /// Talk to a server that is already listening (tests).
+    #[doc(hidden)]
+    pub fn attach(&self, port: u16) {
+        let mut g = self.inner.lock().unwrap();
+        g.port = port;
+        g.state = State::Ready { version: "test".into() };
+    }
+
+    /// Ends the current instance like a restart does (tests).
+    #[doc(hidden)]
+    pub fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Files a killed or crashed run left in the private input and output directories.
+    fn clean_work_files(&self) {
+        let _ = std::fs::remove_dir_all(self.output_dir().join(OUTPUT_PREFIX_DIR));
+        let Ok(entries) = std::fs::read_dir(self.input_dir()) else { return };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(INPUT_PREFIX) {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
 
@@ -160,6 +193,7 @@ impl Comfy {
         for d in [&input, &output, &temp, &user] {
             std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
+        self.clean_work_files();
         // Only the verified files' folders are registered, and they take precedence over ComfyUI's own models.
         let base = model_dir.display().to_string().replace('\\', "/");
         let yaml = format!(
@@ -214,10 +248,8 @@ impl Comfy {
     }
 
     fn log_tail(&self) -> String {
-        let mut s = String::new();
-        if let Ok(mut f) = std::fs::File::open(self.log_path()) {
-            let _ = f.read_to_string(&mut s);
-        }
+        // Lossy: native libraries may write in the system code page.
+        let s = std::fs::read(self.log_path()).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
         let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
         lines[lines.len().saturating_sub(3)..].join(" / ")
     }
@@ -264,6 +296,7 @@ impl Comfy {
             if started.elapsed() > START_TIMEOUT {
                 self.log.error("ComfyUI did not answer within 5 minutes");
                 self.set_state(gen, State::Failed("timeout".into()));
+                self.kill();
                 return;
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -305,17 +338,19 @@ impl Comfy {
         cancel: &AtomicBool,
         mut on_progress: impl FnMut(u32, u32),
     ) -> Result<Vec<PathBuf>, RunError> {
-        let url = self.url().ok_or_else(|| RunError::Failed("ComfyUI is not ready".into()))?;
+        let generation = self.generation.load(Ordering::SeqCst);
+        let url = self.url().ok_or_else(|| Failure::NotRunning("not ready".into()))?;
         let client_id = random_hex();
         let port = self.port();
-        // Connect first so no progress message is missed.
+        // Connect first so no progress message is missed. The short read timeout must not apply to the handshake.
         let mut ws = TcpStream::connect(("127.0.0.1", port)).ok().and_then(|tcp| {
-            tcp.set_read_timeout(Some(Duration::from_millis(250))).ok()?;
-            tungstenite::client(format!("ws://127.0.0.1:{port}/ws?clientId={client_id}"), tcp).ok().map(|(ws, _)| ws)
+            tcp.set_read_timeout(Some(WS_HANDSHAKE_TIMEOUT)).ok()?;
+            let (ws, _) = tungstenite::client(format!("ws://127.0.0.1:{port}/ws?clientId={client_id}"), tcp).ok()?;
+            ws.get_ref().set_read_timeout(Some(Duration::from_millis(250))).ok()?;
+            Some(ws)
         });
-        let resp = post_json(&format!("{url}/prompt"), &json!({"prompt": graph, "client_id": client_id}))
-            .map_err(RunError::Failed)?;
-        let prompt_id = resp["prompt_id"].as_str().ok_or_else(|| RunError::Failed(format!("unexpected answer: {resp}")))?.to_string();
+        let resp = post_json(&format!("{url}/prompt"), &json!({"prompt": graph, "client_id": client_id})).map_err(Failure::classify)?;
+        let prompt_id = resp["prompt_id"].as_str().ok_or_else(|| Failure::Other(format!("unexpected answer: {resp}")))?.to_string();
         let mut last_poll = Instant::now();
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -323,8 +358,12 @@ impl Comfy {
                 let _ = post_json(&format!("{url}/interrupt"), &json!({"prompt_id": prompt_id}));
                 return Err(RunError::Cancelled);
             }
+            // Restarted meanwhile: this run's server is gone, and exited() watches the new process.
+            if self.generation.load(Ordering::SeqCst) != generation {
+                return Err(Failure::Restarted.into());
+            }
             if let Some(code) = self.exited() {
-                return Err(RunError::Failed(format!("ComfyUI stopped ({code})")));
+                return Err(Failure::Stopped(code).into());
             }
             let mut done = false;
             match ws.as_mut().map(|w| w.read()) {
@@ -336,12 +375,13 @@ impl Comfy {
                             Some("progress") => {
                                 on_progress(data["value"].as_u64().unwrap_or(0) as u32, data["max"].as_u64().unwrap_or(0) as u32)
                             }
+                            // Not "execution_success": that comes before the run is in the history.
                             Some("executing") if data["node"].is_null() => done = true,
-                            Some("execution_success") => done = true,
                             Some("execution_error") => {
                                 let m = data["exception_message"].as_str().unwrap_or("error").trim().to_string();
                                 let node = data["node_type"].as_str().unwrap_or("?");
-                                return Err(RunError::Failed(format!("{node}: {m}")));
+                                let kind = data["exception_type"].as_str().unwrap_or("");
+                                return Err(Failure::classify(format!("{node}: {kind} {m}")).into());
                             }
                             Some("execution_interrupted") => return Err(RunError::Cancelled),
                             _ => {}
@@ -364,7 +404,7 @@ impl Comfy {
                 break;
             }
         }
-        let history = get_json(&format!("{url}/history/{prompt_id}"), Duration::from_secs(10)).map_err(RunError::Failed)?;
+        let history = get_json(&format!("{url}/history/{prompt_id}"), Duration::from_secs(10)).map_err(Failure::Other)?;
         let entry = &history[&prompt_id];
         if entry["status"]["status_str"].as_str() == Some("error") {
             let msg = entry["status"]["messages"]
@@ -372,11 +412,11 @@ impl Comfy {
                 .and_then(|m| m.iter().find(|m| m[0] == "execution_error"))
                 .and_then(|m| m[1]["exception_message"].as_str())
                 .unwrap_or("execution error");
-            return Err(RunError::Failed(msg.trim().to_string()));
+            return Err(Failure::classify(msg.trim().to_string()).into());
         }
         let images = entry["outputs"][output_node]["images"].as_array().cloned().unwrap_or_default();
         if images.is_empty() {
-            return Err(RunError::Failed("the workflow produced no image".into()));
+            return Err(Failure::Other("the workflow produced no image".into()).into());
         }
         Ok(images
             .iter()
@@ -391,10 +431,56 @@ impl Comfy {
     }
 }
 
+/// Why a run failed. The UI says it in its own language; the log gets `detail()`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Failure {
+    NotSetUp,
+    TooOld(Vec<String>),
+    /// The instance is not running; what is known about why.
+    NotRunning(String),
+    ModelsInvalid,
+    /// The process ended during the run.
+    Stopped(String),
+    /// Settings restarted the instance during the run.
+    Restarted,
+    OutOfMemory(String),
+    Other(String),
+}
+
+impl Failure {
+    /// A ComfyUI error message, recognizing the failure the user can act on.
+    pub fn classify(message: String) -> Self {
+        let lower = message.to_lowercase();
+        if lower.contains("out of memory") || lower.contains("outofmemory") || lower.contains("allocation on device") {
+            Self::OutOfMemory(message)
+        } else {
+            Self::Other(message)
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NotSetUp => "ComfyUI is not set up (Settings > ComfyUI)".into(),
+            Self::TooOld(nodes) => format!("ComfyUI is too old (missing {})", nodes.join(", ")),
+            Self::NotRunning(e) => format!("ComfyUI is not running: {e}"),
+            Self::ModelsInvalid => "the model files are missing or not verified (Settings > Models)".into(),
+            Self::Stopped(code) => format!("ComfyUI stopped ({code})"),
+            Self::Restarted => "ComfyUI was restarted during the run".into(),
+            Self::OutOfMemory(m) | Self::Other(m) => m.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RunError {
     Cancelled,
-    Failed(String),
+    Failed(Failure),
+}
+
+impl From<Failure> for RunError {
+    fn from(f: Failure) -> Self {
+        Self::Failed(f)
+    }
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {

@@ -5,6 +5,9 @@
 //! the shaded image's resolution, then brought to the original's resolution by guided upsampling, so its edges
 //! follow the full-resolution original. Only darkening is kept (L <= 1).
 
+use std::path::Path;
+use std::sync::Arc;
+
 use crate::resample::{self, Filter};
 
 /// Regularizes the ratio in near-black pixels (ratio of tiny numbers) towards "no shadow".
@@ -19,13 +22,30 @@ pub struct Image8 {
     pub has_alpha: bool,
     /// RGBA, 4 bytes per pixel (alpha 255 when the file has none).
     pub rgba: Vec<u8>,
+    /// Embedded color profile, carried to the exports.
+    pub icc: Option<Arc<Vec<u8>>>,
+    /// The file held more than 8 bits per channel.
+    pub deep: bool,
 }
 
 impl Image8 {
     pub fn from_dynamic(img: &image::DynamicImage) -> Self {
         let has_alpha = img.color().has_alpha();
+        let deep = img.color().bytes_per_pixel() > img.color().channel_count();
         let rgba = img.to_rgba8();
-        Self { w: rgba.width() as usize, h: rgba.height() as usize, has_alpha, rgba: rgba.into_raw() }
+        Self { w: rgba.width() as usize, h: rgba.height() as usize, has_alpha, rgba: rgba.into_raw(), icc: None, deep }
+    }
+
+    /// Decode an image file, applying its EXIF orientation (as ComfyUI's LoadImage does) and keeping its color profile.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        use image::ImageDecoder;
+        let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
+        let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+        let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+        let icc = decoder.icc_profile().ok().flatten().map(Arc::new);
+        let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+        img.apply_orientation(orientation);
+        Ok(Self { icc, ..Self::from_dynamic(&img) })
     }
 
     fn rgb_bytes(&self) -> Vec<u8> {
@@ -40,7 +60,7 @@ impl Image8 {
             let rgb = resample::resize_u8(&self.rgb_bytes(), self.w, self.h, 3, nw, nh, Filter::Lanczos);
             rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect()
         };
-        Image8 { w: nw, h: nh, has_alpha: self.has_alpha, rgba }
+        Image8 { w: nw, h: nh, has_alpha: self.has_alpha, rgba, icc: None, deep: false }
     }
 
     /// Python `_rgb`: transparent images are composited over white, then scaled to 0..1.

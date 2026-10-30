@@ -1,5 +1,21 @@
 //! Shadow layer over the original with a Photoshop-style blend mode and opacity (canvas and export).
 
+use crate::shading::{Image8, Layers};
+
+/// Layers of the layer panel, top to bottom (indexes of `View::visible` and `View::opacity`).
+pub const SHADOW: usize = 0;
+pub const AI: usize = 1;
+pub const ORIGINAL: usize = 2;
+
+/// What the layer panel shows; canvas and exports both flatten it through `flatten_view`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct View {
+    pub visible: [bool; 3],
+    /// The original's stays 1.
+    pub opacity: [f32; 3],
+    pub mode: Mode,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Multiply,
@@ -135,14 +151,17 @@ pub fn composite(original: &[u8], layer: &[u8], layer_channels: usize, mode: Mod
 /// The visible layers of the layer panel, bottom to top: original, AI output (normal blend), shadow.
 pub struct Stack<'a> {
     pub original: Option<&'a [u8]>,
+    /// The source image's RGBA, visible or not: the shadow never leaves its silhouette.
+    pub silhouette: &'a [u8],
     /// RGBA at the original's size, opacity.
     pub ai: Option<(&'a [u8], f32)>,
     /// Layer pixels (1 or 3 channels), channels, mode, opacity.
     pub shadow: Option<(&'a [u8], usize, Mode, f32)>,
 }
 
-/// Flatten the visible layers into RGBA (transparent where nothing is visible), like an image editor:
-/// the shadow blends with whatever is below it, and shows as itself over transparency.
+/// Flatten the visible layers into RGBA (transparent where nothing is visible), like an image editor: the shadow
+/// blends with whatever is below it. It adds no coverage of its own over the original, so a transparent source stays
+/// transparent; with the original hidden it shows as itself, inside the source's silhouette.
 pub fn flatten(stack: &Stack, pixels: usize) -> Vec<u8> {
     let mut out = match stack.original {
         Some(o) => o.to_vec(),
@@ -164,7 +183,11 @@ pub fn flatten(stack: &Stack, pixels: usize) -> Vec<u8> {
     let Some((layer, ch, mode, op)) = stack.shadow else { return out };
     let blended = composite(&out, layer, ch, mode, op);
     let op = op.clamp(0.0, 1.0);
+    let over_original = stack.original.is_some();
+    let over_ai = stack.ai.is_some();
     for (i, (d, b)) in out.chunks_exact_mut(4).zip(blended.chunks_exact(4)).enumerate() {
+        let source_alpha = stack.silhouette[i * 4 + 3];
+        let keep = source_alpha as f32 / 255.0;
         let below = d[3] as f32 / 255.0;
         // Where nothing is below, the layer shows as itself (black with its alpha for Normal).
         let (rgb, la) = if mode == Mode::Normal {
@@ -174,14 +197,53 @@ pub fn flatten(stack: &Stack, pixels: usize) -> Vec<u8> {
         } else {
             ([layer[i]; 3], op)
         };
-        let own = la * (1.0 - below);
+        let mut shaded = [b[0], b[1], b[2]];
+        if source_alpha != 255 && over_ai {
+            // Over the AI layer the shadow fades out with the silhouette (a layer with alpha, as in the PSD).
+            for c in 0..3 {
+                shaded[c] = (d[c] as f32 + (b[c] as f32 - d[c] as f32) * keep + 0.5) as u8;
+            }
+        }
+        let own = if over_original { 0.0 } else { la * keep * (1.0 - below) };
         let oa = below + own;
         if oa > 0.0 {
             for c in 0..3 {
-                d[c] = ((b[c] as f32 * below + rgb[c] as f32 * own) / oa + 0.5) as u8;
+                d[c] = ((shaded[c] as f32 * below + rgb[c] as f32 * own) / oa + 0.5) as u8;
             }
         }
         d[3] = (oa * 255.0 + 0.5) as u8;
     }
     out
+}
+
+/// The layer panel flattened: what the canvas shows and the composite export writes.
+pub fn flatten_view(original: &Image8, ai_full: &[u8], layers: &Layers, view: &View) -> Vec<u8> {
+    let channels = if layers.color { 3 } else { 1 };
+    flatten(
+        &Stack {
+            original: view.visible[ORIGINAL].then_some(original.rgba.as_slice()),
+            silhouette: &original.rgba,
+            ai: view.visible[AI].then_some((ai_full, view.opacity[AI])),
+            shadow: view.visible[SHADOW].then_some((layers.multiply.as_slice(), channels, view.mode, view.opacity[SHADOW])),
+        },
+        layers.w * layers.h,
+    )
+}
+
+/// The shadow as a layer of its own (RGBA, inside the source's silhouette): the multiply layer, or for Normal the
+/// black layer with alpha.
+pub fn shadow_rgba(layers: &Layers, mode: Mode, original: &[u8]) -> Vec<u8> {
+    let source_alpha = original.chunks_exact(4).map(|p| p[3]);
+    if mode == Mode::Normal {
+        return layers.overlay.chunks_exact(4).zip(source_alpha).flat_map(|(p, a)| [0, 0, 0, scale_alpha(p[3], a)]).collect();
+    }
+    if layers.color {
+        layers.multiply.chunks_exact(3).zip(source_alpha).flat_map(|(p, a)| [p[0], p[1], p[2], a]).collect()
+    } else {
+        layers.multiply.iter().zip(source_alpha).flat_map(|(&v, a)| [v, v, v, a]).collect()
+    }
+}
+
+fn scale_alpha(alpha: u8, by: u8) -> u8 {
+    ((alpha as u32 * by as u32 + 127) / 255) as u8
 }

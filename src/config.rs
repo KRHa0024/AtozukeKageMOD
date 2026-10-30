@@ -26,6 +26,10 @@ pub struct Config {
     pub quality: u8,
     pub out_dir: String,
     pub blend: usize,
+    /// Canvas surround: 0 light, 1 mid gray, 2 dark.
+    pub canvas_shade: usize,
+    /// Inner window size in points.
+    pub window: Option<[f32; 2]>,
 }
 
 impl Default for Config {
@@ -48,6 +52,8 @@ impl Default for Config {
             quality: 92,
             out_dir: default_out_dir().display().to_string(),
             blend: 0,
+            canvas_shade: 0,
+            window: None,
         }
     }
 }
@@ -57,13 +63,27 @@ impl Config {
     pub fn load(data: &Path) -> (Self, Option<String>) {
         let path = data.join("settings.json");
         let Ok(text) = std::fs::read_to_string(&path) else { return (Self::default(), None) };
-        match serde_json::from_str(&text) {
-            Ok(cfg) => (cfg, None),
+        match serde_json::from_str::<Self>(&text) {
+            Ok(cfg) => (cfg.sanitized(), None),
             Err(e) => {
                 let _ = std::fs::rename(&path, data.join("settings.json.bad"));
                 (Self::default(), Some(format!("settings.json could not be read ({e}); using defaults")))
             }
         }
+    }
+
+    /// Values in range, whatever a hand-edited file says: the UI indexes tables with them.
+    fn sanitized(mut self) -> Self {
+        self.model_dir = self.model_dir.trim().to_string();
+        self.comfy_dir = self.comfy_dir.trim().to_string();
+        self.light_dir = self.light_dir.min(8);
+        self.strength = if self.strength.is_finite() { self.strength.clamp(0.5, 1.5) } else { 1.0 };
+        self.export_format = self.export_format.min(3);
+        self.png_level = self.png_level.min(9);
+        self.quality = self.quality.clamp(1, 100);
+        self.blend = self.blend.min(7);
+        self.canvas_shade = self.canvas_shade.min(2);
+        self
     }
 
     pub fn save(&self, data: &Path) -> std::io::Result<()> {
