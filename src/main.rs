@@ -18,7 +18,7 @@ use eframe::egui::{
 };
 use egui_phosphor::regular as ph;
 use i18n::{t, Lang, T};
-use kage::blend::{self, MODES};
+use kage::blend::{self, MENU_ORDER, MODES};
 use kage::comfy::{self, Comfy};
 use kage::config::{self, Config};
 use kage::export::{self, Format, Pixels, PsdLayer, FORMATS};
@@ -66,13 +66,10 @@ enum Screen {
     Settings,
 }
 
-#[derive(PartialEq, Clone, Copy)]
-enum LayerView {
-    Result,
-    Multiply,
-    Normal,
-    Ai,
-}
+/// Layers of the layer panel (also the order of `App::visible` / `App::opacity`), top to bottom.
+const SHADOW: usize = 0;
+const AI: usize = 1;
+const ORIGINAL: usize = 2;
 
 #[derive(Clone, Copy)]
 enum Phase {
@@ -102,11 +99,20 @@ struct Entry {
 /// Textures of the shown result.
 struct Views {
     key: (u64, u64),
-    comp_key: Option<(usize, u32)>,
-    composite: TextureHandle,
-    multiply: TextureHandle,
-    overlay: TextureHandle,
-    ai: TextureHandle,
+    stack_key: Option<StackKey>,
+    /// The visible layers flattened: what the canvas shows.
+    stack: TextureHandle,
+    /// AI output at the original's size (RGBA), to blend with the other layers.
+    ai_full: Vec<u8>,
+    /// Layer panel thumbnails (shadow, AI output, original).
+    thumbs: [TextureHandle; 3],
+}
+
+#[derive(PartialEq, Clone, Copy)]
+struct StackKey {
+    visible: [bool; 3],
+    blend: usize,
+    opacity: [u32; 3],
 }
 
 struct Resolve {
@@ -132,7 +138,8 @@ struct Shot {
     auto: Option<String>,
     started: bool,
     done_frame: Option<u32>,
-    view: Option<LayerView>,
+    /// Show only this layer (and this blend mode) before the shot.
+    solo: Option<(usize, Option<usize>)>,
     /// After the run: change the strength (re-solve), then export.
     resolve: Option<f32>,
     export: bool,
@@ -175,14 +182,16 @@ struct App {
     post_seen: (f32, bool, bool),
     post_changed_at: f64,
 
-    layer_menu_open: bool,
-    layer_view: LayerView,
-    opacity: f32,
+    visible: [bool; 3],
+    selected_layer: usize,
+    /// Per layer; the original's stays 1.
+    opacity: [f32; 3],
     compare_on: bool,
     compare: f32,
     zoom: Option<f32>,
     pan: Vec2,
-    history_open: bool,
+    /// Right panel: 0 layers, 1 history.
+    right_tab: usize,
     export_open: bool,
     export_rx: Option<Receiver<Result<(usize, PathBuf), String>>>,
     toast: Option<Toast>,
@@ -241,14 +250,14 @@ impl App {
             views: None,
             resolve: None,
             post_changed_at: 0.0,
-            layer_menu_open: false,
-            layer_view: LayerView::Result,
-            opacity: 1.0,
-            compare_on: true,
+            visible: [true, false, true],
+            selected_layer: SHADOW,
+            opacity: [1.0; 3],
+            compare_on: false,
             compare: 0.5,
             zoom: None,
             pan: Vec2::ZERO,
-            history_open: false,
+            right_tab: 0,
             export_open: false,
             export_rx: None,
             toast: None,
@@ -262,10 +271,14 @@ impl App {
 
     fn with_scene(mut self, ctx: &egui::Context) -> Self {
         let Ok(out) = std::env::var("KAGE_SHOT") else { return self };
-        let view = match std::env::var("KAGE_VIEW").as_deref() {
-            Ok("multiply") => Some(LayerView::Multiply),
-            Ok("normal") => Some(LayerView::Normal),
-            Ok("ai") => Some(LayerView::Ai),
+        let solo = match std::env::var("KAGE_VIEW").as_deref() {
+            Ok("multiply") => Some((SHADOW, Some(0))),
+            Ok("normal") => Some((SHADOW, Some(7))),
+            Ok("ai") => Some((AI, None)),
+            Ok("compare") => {
+                self.compare_on = true;
+                None
+            }
             _ => None,
         };
         self.shot = Some(Shot {
@@ -274,7 +287,7 @@ impl App {
             auto: std::env::var("KAGE_AUTO").ok(),
             started: false,
             done_frame: None,
-            view,
+            solo,
             resolve: std::env::var("KAGE_RESOLVE").ok().and_then(|v| v.parse().ok()),
             export: std::env::var("KAGE_EXPORT").is_ok(),
         });
@@ -288,9 +301,8 @@ impl App {
             }
         }
         match scene.as_str() {
-            "layers" => self.layer_menu_open = true,
             "advanced" => self.adv_default_open = true,
-            "history" => self.history_open = true,
+            "history" => self.right_tab = 1,
             "export" => self.export_open = true,
             "settings_models" => self.screen = Screen::Settings,
             "settings_comfy" => {
@@ -332,8 +344,12 @@ impl App {
                         export = true;
                     } else {
                         shot.done_frame = Some(shot.frame);
-                        if let Some(v) = shot.view {
-                            self.layer_view = v;
+                        if let Some((layer, blend)) = shot.solo {
+                            self.visible = std::array::from_fn(|i| i == layer);
+                            self.selected_layer = layer;
+                            if let Some(b) = blend {
+                                self.cfg.blend = b;
+                            }
                         }
                     }
                 }
@@ -458,7 +474,6 @@ impl App {
         self.steps = (0, 0);
         self.first_step_at = None;
         self.error = None;
-        self.layer_view = LayerView::Result;
     }
 
     fn entry(&self, id: Option<u64>) -> Option<&Entry> {
@@ -512,6 +527,8 @@ impl App {
                     }
                     self.phase = Phase::Done { at: now };
                     self.run_rx = None;
+                    self.visible = [true, false, true];
+                    self.selected_layer = SHADOW;
                 }
                 Event::Failed(msg) => {
                     self.error = Some(msg);
@@ -615,7 +632,12 @@ impl App {
         self.applied_dirs = dirs;
     }
 
+    fn stack_key(&self) -> StackKey {
+        StackKey { visible: self.visible, blend: self.cfg.blend, opacity: self.opacity.map(|o| (o * 1000.0).round() as u32) }
+    }
+
     fn ensure_views(&mut self, ctx: &egui::Context) {
+        let stack_key = self.stack_key();
         // Field-level borrow so self.views can be replaced below.
         let Some(e) = self.current.and_then(|id| self.history.iter().find(|e| e.id == id)) else {
             self.views = None;
@@ -623,27 +645,27 @@ impl App {
         };
         let key = (e.id, e.serial);
         let max = max_side(ctx);
-        let l = &e.result.layers;
+        let (r, l) = (&e.result, &e.result.layers);
         if self.views.as_ref().map(|v| v.key) != Some(key) {
-            let mul = layer_rgba(&l.multiply, l.color);
-            let opts = egui::TextureOptions::LINEAR;
-            let s = &e.result.shaded;
+            let s = &r.shaded;
+            let ai_full = export::to_canvas_rgba(&Pixels { w: s.w, h: s.h, channels: 4, data: &s.rgba }, l.w, l.h);
             self.views = Some(Views {
                 key,
-                comp_key: None,
-                composite: ctx.load_texture("composite", color_image(&l.preview, l.w, l.h, max), opts),
-                multiply: ctx.load_texture("multiply", color_image(&mul, l.w, l.h, max), opts),
-                overlay: ctx.load_texture("overlay", color_image(&l.overlay, l.w, l.h, max), opts),
-                ai: ctx.load_texture("ai", color_image(&s.rgba, s.w, s.h, max), opts),
+                stack_key: None,
+                stack: ctx.load_texture("stack", egui::ColorImage::filled([1, 1], Color32::TRANSPARENT), egui::TextureOptions::LINEAR),
+                ai_full,
+                thumbs: [
+                    thumbnail(ctx, &layer_rgba(&l.multiply, l.color), l.w, l.h),
+                    thumbnail(ctx, &s.rgba, s.w, s.h),
+                    thumbnail(ctx, &r.original.rgba, l.w, l.h),
+                ],
             });
         }
-        let comp_key = (self.cfg.blend, (self.opacity * 1000.0).round() as u32);
         let views = self.views.as_mut().expect("views");
-        if views.comp_key != Some(comp_key) {
-            // Not layers.preview: that one is computed over white (Python semantics), which lightens half-transparent pixels.
-            let rgba = blend::composite(&e.result.original.rgba, &l.multiply, if l.color { 3 } else { 1 }, MODES[self.cfg.blend], self.opacity);
-            views.composite.set(color_image(&rgba, l.w, l.h, max), egui::TextureOptions::LINEAR);
-            views.comp_key = Some(comp_key);
+        if views.stack_key != Some(stack_key) {
+            let rgba = flatten(r, &views.ai_full, self.visible, self.cfg.blend, self.opacity);
+            views.stack.set(color_image(&rgba, l.w, l.h, max), egui::TextureOptions::LINEAR);
+            views.stack_key = Some(stack_key);
         }
     }
 
@@ -661,13 +683,14 @@ impl App {
         let shaded = r.shaded.clone();
         let (w, h, color) = (r.layers.w, r.layers.h, r.layers.color);
         let multiply = r.layers.multiply.clone();
+        let overlay = r.layers.overlay.clone();
+        let (visible, opacity) = (self.visible, self.opacity);
         let mode = MODES[self.cfg.blend];
-        let opacity = self.opacity;
         let format = FORMATS[self.cfg.export_format.min(3)];
         let (png_level, quality) = (self.cfg.png_level, self.cfg.quality);
         let dir = PathBuf::from(self.cfg.out_dir.trim());
         let stem = Path::new(&r.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
-        let names = (t.views[0], t.views[1], t.views[3]);
+        let names = t.layer_names;
         let log = self.log.clone();
         let (tx, rx) = mpsc::channel();
         let repaint = ctx.clone();
@@ -675,15 +698,25 @@ impl App {
             let result = (|| -> Result<(usize, PathBuf), String> {
                 std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
                 let lch = if color { 3 } else { 1 };
-                let composite = blend::composite(&original.rgba, &multiply, lch, mode, opacity);
+                let ai_full = export::to_canvas_rgba(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, w, h);
+                // The composite is what the layer panel shows (visibility, blend mode, opacity).
+                let composite = blend::flatten(
+                    &blend::Stack {
+                        original: visible[ORIGINAL].then_some(original.rgba.as_slice()),
+                        ai: visible[AI].then_some((ai_full.as_slice(), opacity[AI])),
+                        shadow: visible[SHADOW].then_some((multiply.as_slice(), lch, mode, opacity[SHADOW])),
+                    },
+                    w * h,
+                );
                 let mut written = Vec::new();
                 if format == Format::Psd {
-                    let mut layers = vec![PsdLayer { name: "Original", rgba: original.rgba.clone(), mode: None, opacity: 1.0, visible: true }];
-                    if targets[1] {
-                        let ai = export::to_canvas_rgba(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, w, h);
-                        layers.push(PsdLayer { name: names.2, rgba: ai, mode: None, opacity: 1.0, visible: false });
-                    }
-                    layers.push(PsdLayer { name: names.1, rgba: layer_rgba(&multiply, color), mode: Some(mode), opacity, visible: true });
+                    // Same layers as the panel; the normal-blend shadow is the black layer with alpha.
+                    let shadow = if mode == blend::Mode::Normal { overlay.clone() } else { layer_rgba(&multiply, color) };
+                    let layers = [
+                        PsdLayer { name: names[ORIGINAL], rgba: original.rgba.clone(), mode: None, opacity: 1.0, visible: visible[ORIGINAL] },
+                        PsdLayer { name: names[AI], rgba: ai_full, mode: None, opacity: opacity[AI], visible: visible[AI] },
+                        PsdLayer { name: names[SHADOW], rgba: shadow, mode: Some(mode), opacity: opacity[SHADOW], visible: visible[SHADOW] },
+                    ];
                     let path = export::unique_path(&dir, &stem, "kage", "psd");
                     export::save_psd(&path, w, h, &layers, &composite)?;
                     written.push(path);
@@ -745,8 +778,6 @@ impl App {
         let t = self.t();
         let has_result = self.current.is_some();
         ui.horizontal_centered(|ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new(t.app_name).strong().color(TEXT));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button(format!("{}  {}", ph::GEAR_SIX, t.settings)).on_hover_text(t.settings_tip).clicked() {
                     self.screen = Screen::Settings;
@@ -761,13 +792,6 @@ impl App {
                 }
                 self.language_combo(ui);
                 ui.separator();
-                if ui
-                    .add(Button::icon_text(ph::CLOCK_COUNTER_CLOCKWISE, t.history).selected(self.history_open))
-                    .on_hover_text(t.history_tip)
-                    .clicked()
-                {
-                    self.history_open = !self.history_open;
-                }
                 if ui
                     .add_enabled(has_result && self.export_rx.is_none(), Button::icon_text(ph::DOWNLOAD_SIMPLE, t.export))
                     .on_hover_text(t.export_tip)
@@ -946,11 +970,7 @@ impl App {
             painter.text(inner.center() + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, t.drop_here, FontId::proportional(15.0), MUTED);
             return;
         };
-        self.ensure_views(&ctx);
         let has_result = self.views.is_some();
-        if !has_result {
-            self.layer_view = LayerView::Result;
-        }
 
         // Pan (drag) and zoom (wheel, around the cursor).
         let size = Vec2::new(img.img.w as f32, img.img.h as f32);
@@ -959,7 +979,7 @@ impl App {
         let mut divider_drag = false;
         let img_rect = Rect::from_center_size(rect.center() + self.pan, size * scale);
         let divider_x = img_rect.left() + img_rect.width() * self.compare;
-        let compare_active = has_result && self.compare_on && self.layer_view == LayerView::Result;
+        let compare_active = has_result && self.compare_on;
         if compare_active {
             let handle = Rect::from_x_y_ranges(divider_x - 8.0..=divider_x + 8.0, img_rect.y_range());
             let h = ui.interact(handle, Id::new("divider"), Sense::drag());
@@ -989,19 +1009,18 @@ impl App {
         let img_rect = Rect::from_center_size(rect.center() + self.pan, size * scale);
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         painter.rect_filled(img_rect.expand(1.0), CornerRadius::ZERO, Color32::from_black_alpha(40));
-        if img.img.has_alpha {
-            checkerboard(&painter, img_rect.intersect(rect));
-        }
-
-        match (&self.views, self.layer_view) {
-            (Some(v), LayerView::Result) => {
-                painter.image(img.tex.id(), img_rect, full_uv, Color32::WHITE);
+        match &self.views {
+            Some(v) => {
+                // Hidden layers can leave the stack transparent.
+                checkerboard(&painter, img_rect.intersect(rect));
                 let split = if compare_active { self.compare } else { 1.0 };
-                let shaded = Rect::from_min_max(img_rect.min, Pos2::new(img_rect.left() + img_rect.width() * split, img_rect.bottom()));
-                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(split, 1.0));
-                painter.image(v.composite.id(), shaded, uv, Color32::WHITE);
+                let left = Rect::from_min_max(img_rect.min, Pos2::new(img_rect.left() + img_rect.width() * split, img_rect.bottom()));
+                painter.image(v.stack.id(), left, Rect::from_min_max(Pos2::ZERO, Pos2::new(split, 1.0)), Color32::WHITE);
                 if compare_active {
-                    let x = img_rect.left() + img_rect.width() * self.compare;
+                    // Right of the divider: the original alone.
+                    let right = Rect::from_min_max(Pos2::new(left.right(), img_rect.top()), img_rect.max);
+                    painter.image(img.tex.id(), right, Rect::from_min_max(Pos2::new(split, 0.0), Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    let x = left.right();
                     painter.line_segment([Pos2::new(x, img_rect.top()), Pos2::new(x, img_rect.bottom())], Stroke::new(2.0, Color32::WHITE));
                     let knob = Rect::from_center_size(Pos2::new(x, img_rect.center().y), Vec2::new(22.0, 34.0));
                     painter.rect_filled(knob, CornerRadius::same(2), Color32::WHITE);
@@ -1009,17 +1028,10 @@ impl App {
                     painter.text(knob.center(), Align2::CENTER_CENTER, ph::ARROWS_LEFT_RIGHT, FontId::proportional(14.0), TEXT);
                 }
             }
-            (Some(v), LayerView::Multiply) => {
-                painter.image(v.multiply.id(), img_rect, full_uv, Color32::WHITE);
-            }
-            (Some(v), LayerView::Normal) => {
-                checkerboard(&painter, img_rect.intersect(rect));
-                painter.image(v.overlay.id(), img_rect, full_uv, Color32::WHITE);
-            }
-            (Some(v), LayerView::Ai) => {
-                painter.image(v.ai.id(), img_rect, full_uv, Color32::WHITE);
-            }
-            (None, _) => {
+            None => {
+                if img.img.has_alpha {
+                    checkerboard(&painter, img_rect.intersect(rect));
+                }
                 painter.image(img.tex.id(), img_rect, full_uv, Color32::WHITE);
             }
         }
@@ -1035,54 +1047,7 @@ impl App {
             .corner_radius(CornerRadius::same(2))
             .inner_margin(Margin::symmetric(6, 4));
 
-        // Layer menu (top left)
-        egui::Area::new(Id::new("layer_menu")).fixed_pos(rect.left_top() + Vec2::new(8.0, 8.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            overlay.show(ui, |ui| {
-                let label = match self.layer_view {
-                    LayerView::Result => format!("{}  {} · {}  {}", ph::STACK, t.views[0], t.blends[self.cfg.blend], ph::CARET_DOWN),
-                    v => format!("{}  {}  {}", ph::STACK, t.views[v as usize], ph::CARET_DOWN),
-                };
-                if ui.add(egui::Button::new(label).frame(false)).on_hover_text(t.layer_tip).clicked() {
-                    self.layer_menu_open = !self.layer_menu_open;
-                }
-                if self.layer_menu_open {
-                    ui.separator();
-                    ui.set_width(250.0);
-                    ui.label(RichText::new(t.view).strong());
-                    for (i, v) in [LayerView::Result, LayerView::Multiply, LayerView::Normal, LayerView::Ai].into_iter().enumerate() {
-                        ui.add_enabled_ui(has_result || i == 0, |ui| ui.radio_value(&mut self.layer_view, v, t.views[i]));
-                    }
-                    ui.separator();
-                    ui.label(RichText::new(t.blend_title).strong());
-                    egui::ComboBox::from_id_salt("blend").width(240.0).selected_text(t.blends[self.cfg.blend]).show_ui(ui, |ui| {
-                        for (i, name) in t.blends.iter().enumerate() {
-                            ui.selectable_value(&mut self.cfg.blend, i, *name);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(t.opacity).strong());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(format!("{:.0}%", self.opacity * 100.0)).monospace());
-                        });
-                    });
-                    ui.spacing_mut().slider_width = 240.0;
-                    ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).show_value(false));
-                }
-            });
-        });
-
-        // Compare toggle (top right)
-        egui::Area::new(Id::new("compare"))
-            .fixed_pos(rect.right_top() + Vec2::new(-8.0, 8.0))
-            .pivot(Align2::RIGHT_TOP)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                overlay.show(ui, |ui| {
-                    ui.add_enabled_ui(has_result, |ui| ui.checkbox(&mut self.compare_on, t.compare).on_hover_text(t.compare_tip));
-                });
-            });
-
-        // Zoom (bottom right)
+        // View tools (bottom right): compare, zoom.
         egui::Area::new(Id::new("zoom"))
             .fixed_pos(rect.right_bottom() + Vec2::new(-8.0, -8.0))
             .pivot(Align2::RIGHT_BOTTOM)
@@ -1090,6 +1055,11 @@ impl App {
             .show(ctx, |ui| {
                 overlay.show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        let compare = egui::Button::new(format!("{}  {}", ph::SQUARE_SPLIT_HORIZONTAL, t.compare)).selected(has_result && self.compare_on);
+                        if ui.add_enabled(has_result, compare).on_hover_text(t.compare_tip).clicked() {
+                            self.compare_on = !self.compare_on;
+                        }
+                        ui.separator();
                         if ui.button("−").on_hover_text(t.zoom_out).clicked() {
                             self.zoom = Some((scale / 1.25).max(0.05));
                         }
@@ -1108,12 +1078,12 @@ impl App {
                 });
             });
 
-        // Export result (bottom center)
+        // Export result (top center)
         if let Some(toast) = &self.toast {
             let mut open_dir = None;
             egui::Area::new(Id::new("toast"))
-                .fixed_pos(rect.center_bottom() + Vec2::new(0.0, -12.0))
-                .pivot(Align2::CENTER_BOTTOM)
+                .fixed_pos(rect.center_top() + Vec2::new(0.0, 12.0))
+                .pivot(Align2::CENTER_TOP)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     overlay.show(ui, |ui| {
@@ -1135,17 +1105,144 @@ impl App {
         }
     }
 
-    fn history(&mut self, ui: &mut egui::Ui) {
+    fn right_panel(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(t.history).strong());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button(ph::X).clicked() {
-                    self.history_open = false;
+            for (i, label) in [t.tab_layers, t.history].into_iter().enumerate() {
+                if ui.add(egui::Button::new(label).selected(self.right_tab == i).min_size(Vec2::new(96.0, 26.0))).clicked() {
+                    self.right_tab = i;
                 }
-            });
+            }
         });
         ui.separator();
+        match self.right_tab {
+            0 => self.layers(ui),
+            _ => self.history(ui),
+        }
+    }
+
+    /// Image-editor style layer list: eye = visibility (Alt+click: only this one), row = selection; the selected
+    /// layer's blend mode and opacity are edited above the list.
+    fn layers(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
+        let has_result = self.views.is_some();
+        let ids: Vec<usize> = if has_result {
+            vec![SHADOW, AI, ORIGINAL]
+        } else if self.image.is_some() {
+            vec![ORIGINAL]
+        } else {
+            vec![]
+        };
+        let sel = if ids.contains(&self.selected_layer) { self.selected_layer } else { ids.first().copied().unwrap_or(ORIGINAL) };
+
+        egui::Grid::new("layer_props").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+            ui.label(t.blend_title);
+            ui.add_enabled_ui(has_result && sel == SHADOW, |ui| {
+                let text = if sel == SHADOW { t.blends[self.cfg.blend] } else { t.normal };
+                egui::ComboBox::from_id_salt("blend").width(176.0).selected_text(text).show_ui(ui, |ui| {
+                    for i in MENU_ORDER {
+                        ui.selectable_value(&mut self.cfg.blend, i, t.blends[i]);
+                    }
+                });
+            });
+            ui.end_row();
+            ui.label(t.opacity);
+            ui.add_enabled_ui(has_result && sel != ORIGINAL, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().slider_width = 128.0;
+                    ui.add(egui::Slider::new(&mut self.opacity[sel], 0.0..=1.0).show_value(false));
+                    ui.label(RichText::new(format!("{:>3.0}%", self.opacity[sel] * 100.0)).monospace());
+                });
+            });
+            ui.end_row();
+        });
+        ui.separator();
+
+        if ids.is_empty() {
+            ui.add(egui::Label::new(RichText::new(t.no_layers).color(MUTED)).wrap());
+            return;
+        }
+        let mut select = None;
+        let mut eye: Option<(usize, bool)> = None;
+        for &id in &ids {
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click());
+            if sel == id {
+                ui.painter().rect_filled(r, CornerRadius::same(2), SEL);
+                ui.painter().rect_stroke(r, CornerRadius::same(2), Stroke::new(1.0, BLUE), StrokeKind::Inside);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(r, CornerRadius::same(2), Color32::from_gray(0xe6));
+            }
+            let visible = self.visible[id];
+            // Eye (registered after the row, so it gets its own clicks).
+            let eye_rect = Rect::from_min_size(Pos2::new(r.left() + 4.0, r.center().y - 14.0), Vec2::splat(28.0));
+            let eye_resp = ui.interact(eye_rect, Id::new(("eye", id)), Sense::click());
+            let eye_fill = if eye_resp.hovered() { Color32::from_gray(0xe6) } else { Color32::from_gray(0xf8) };
+            ui.painter().rect_filled(eye_rect, CornerRadius::same(2), eye_fill);
+            ui.painter().rect_stroke(eye_rect, CornerRadius::same(2), Stroke::new(1.0, LINE), StrokeKind::Inside);
+            let (icon, icon_color) = if visible { (ph::EYE, TEXT) } else { (ph::EYE_SLASH, Color32::from_gray(0x9a)) };
+            ui.painter().text(eye_rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(16.0), icon_color);
+            let label = format!("{}: {}", if visible { t.hide } else { t.show }, t.layer_names[id]);
+            if eye_resp.on_hover_text(format!("{label}\n{}", t.eye_tip)).clicked() {
+                eye = Some((id, ui.input(|i| i.modifiers.alt)));
+            } else if resp.clicked() {
+                select = Some(id);
+            }
+            // Thumbnail.
+            let slot = Rect::from_min_size(Pos2::new(eye_rect.right() + 8.0, r.top() + 5.0), Vec2::new(34.0, 48.0));
+            if let Some(v) = &self.views {
+                let tex = &v.thumbs[id];
+                let ts = tex.size_vec2();
+                let k = (slot.width() / ts.x).min(slot.height() / ts.y);
+                let thumb = Rect::from_center_size(slot.center(), ts * k);
+                let tint = if visible { Color32::WHITE } else { Color32::from_white_alpha(110) };
+                ui.painter().image(tex.id(), thumb, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
+                ui.painter().rect_stroke(thumb, CornerRadius::ZERO, Stroke::new(1.0, LINE_DARK), StrokeKind::Outside);
+            } else if let Some(img) = &self.image {
+                let ts = Vec2::new(img.img.w as f32, img.img.h as f32);
+                let k = (slot.width() / ts.x).min(slot.height() / ts.y);
+                let thumb = Rect::from_center_size(slot.center(), ts * k);
+                ui.painter().image(img.tex.id(), thumb, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                ui.painter().rect_stroke(thumb, CornerRadius::ZERO, Stroke::new(1.0, LINE_DARK), StrokeKind::Outside);
+            }
+            // Name and blend / opacity.
+            let x = slot.right() + 10.0;
+            let painter = ui.painter_at(r.shrink(2.0));
+            painter.text(Pos2::new(x, r.top() + 20.0), Align2::LEFT_CENTER, t.layer_names[id], FontId::proportional(13.0), if visible { TEXT } else { MUTED });
+            let sub = match id {
+                ORIGINAL => t.background.to_string(),
+                _ => {
+                    let mode = if id == SHADOW { t.blends[self.cfg.blend] } else { t.normal };
+                    format!("{mode} · {:.0}%", self.opacity[id] * 100.0)
+                }
+            };
+            painter.text(Pos2::new(x, r.top() + 40.0), Align2::LEFT_CENTER, sub, FontId::proportional(11.5), MUTED);
+            if id == ORIGINAL {
+                let lock = Pos2::new(r.right() - 16.0, r.center().y);
+                painter.text(lock, Align2::CENTER_CENTER, ph::LOCK_SIMPLE, FontId::proportional(14.0), MUTED);
+                ui.interact(Rect::from_center_size(lock, Vec2::splat(18.0)), Id::new("lock"), Sense::hover()).on_hover_text(t.locked);
+            }
+        }
+        if let Some(id) = select {
+            self.selected_layer = id;
+        }
+        if let Some((id, solo)) = eye {
+            if solo {
+                self.visible = std::array::from_fn(|i| i == id);
+                self.selected_layer = id;
+            } else {
+                self.visible[id] = !self.visible[id];
+            }
+        }
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(t.solo_hint).small().color(MUTED)).wrap());
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.add(egui::Label::new(RichText::new(t.psd_note).small().color(MUTED)).wrap());
+            ui.separator();
+        });
+    }
+
+    fn history(&mut self, ui: &mut egui::Ui) {
+        let t = self.t();
         // "Auto (match the image's light)" -> "Auto": the drawer is narrow.
         let dir_short = |i: usize| {
             let s = t.light_tips[i].split(": ").last().unwrap_or("");
@@ -1672,11 +1769,12 @@ impl eframe::App for App {
                 egui::Panel::top("toolbar").frame(bar).exact_size(36.0).show(ui, |ui| self.toolbar(ui));
                 egui::Panel::bottom("status").frame(bar).exact_size(40.0).show(ui, |ui| self.status_bar(ui));
                 egui::Panel::left("controls").frame(side).exact_size(270.0).resizable(false).show(ui, |ui| self.controls(ui));
-                egui::Panel::right("history")
-                    .frame(Frame::new().fill(PANEL).inner_margin(Margin::same(6)).stroke(Stroke::new(1.0, LINE_DARK)))
+                self.ensure_views(&ctx);
+                egui::Panel::right("right")
+                    .frame(Frame::new().fill(PANEL).inner_margin(Margin::same(8)).stroke(Stroke::new(1.0, LINE)))
                     .exact_size(280.0)
                     .resizable(false)
-                    .show_collapsible(ui, &mut self.history_open.clone(), |ui| self.history(ui));
+                    .show(ui, |ui| self.right_panel(ui));
                 egui::CentralPanel::default().frame(Frame::new().fill(CANVAS)).show(ui, |ui| self.canvas(ui));
                 if self.export_open {
                     self.export_modal(&ctx);
@@ -1740,6 +1838,17 @@ fn color_image(rgba: &[u8], w: usize, h: usize, max: usize) -> egui::ColorImage 
     let k = max as f64 / w.max(h) as f64;
     let (nw, nh) = (((w as f64 * k).round() as usize).max(1), ((h as f64 * k).round() as usize).max(1));
     egui::ColorImage::from_rgba_unmultiplied([nw, nh], &resample::resize_rgba(rgba, w, h, nw, nh, Filter::Bilinear))
+}
+
+/// The visible layers of a result, flattened (what the canvas shows and the composite export writes).
+fn flatten(r: &RunResult, ai_full: &[u8], visible: [bool; 3], blend_idx: usize, opacity: [f32; 3]) -> Vec<u8> {
+    let l = &r.layers;
+    let stack = blend::Stack {
+        original: visible[ORIGINAL].then_some(r.original.rgba.as_slice()),
+        ai: visible[AI].then_some((ai_full, opacity[AI])),
+        shadow: visible[SHADOW].then_some((l.multiply.as_slice(), if l.color { 3 } else { 1 }, MODES[blend_idx], opacity[SHADOW])),
+    };
+    blend::flatten(&stack, l.w * l.h)
 }
 
 /// Multiply layer (gray or RGB) as RGBA.
@@ -1843,11 +1952,11 @@ fn setup_style(ctx: &egui::Context) {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Atozuke Kage MOD")
+            .with_title("後付け影MOD")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([960.0, 640.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("Atozuke Kage MOD", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("後付け影MOD", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
