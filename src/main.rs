@@ -1416,6 +1416,7 @@ impl App {
 
     fn models_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {
         let statuses = self.verifier.statuses();
+        let notes = self.verifier.notes();
         let checking = self.verifier.running();
         let ok = statuses.iter().filter(|s| **s == Status::Ok).count();
         if checking {
@@ -1488,6 +1489,7 @@ impl App {
                         Status::Missing => (ph::CIRCLE_DASHED, AMBER, t.states[2].to_string()),
                         Status::Mismatch => (ph::X_CIRCLE, RED, t.states[3].to_string()),
                         Status::Unchecked => (ph::CIRCLE, MUTED, t.states[4].to_string()),
+                        Status::Copying(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[5].replace("{}", &format!("{:.0}", f * 100.0))),
                     };
                     ui.label(RichText::new(icon).size(17.0).color(color));
                     // Grid columns keep the width of their first layout, so cells must not wrap.
@@ -1498,10 +1500,40 @@ impl App {
                     });
                     ui.add(egui::Label::new(RichText::new(m.folder).monospace().color(MUTED)).extend());
                     ui.add(egui::Label::new(RichText::new(format!("{:.2} GB", m.size as f64 / 1e9)).monospace()).extend());
-                    ui.add(egui::Label::new(RichText::new(text).color(color)).extend()).on_hover_text(m.sha256);
-                    if ui.button(format!("{}  {}", ph::LINK, t.source_page)).on_hover_text(m.source).clicked() {
-                        open_in_explorer(Path::new(m.source));
+                    let note = match &notes[i] {
+                        Some(models::Note::PickedMismatch) => Some(t.picked_mismatch.to_string()),
+                        Some(models::Note::PickedFailed(e)) => Some(t.picked_failed.replace("{}", e)),
+                        None => None,
+                    };
+                    let state = egui::Label::new(RichText::new(text).color(color)).extend();
+                    match note {
+                        Some(note) => {
+                            ui.vertical(|ui| {
+                                ui.add(state).on_hover_text(m.sha256);
+                                ui.add(egui::Label::new(RichText::new(note).small().color(RED)).extend());
+                            });
+                        }
+                        None => {
+                            ui.add(state).on_hover_text(m.sha256);
+                        }
                     }
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("{}  {}", ph::LINK, t.source_page)).on_hover_text(m.source).clicked() {
+                            open_in_explorer(Path::new(m.source));
+                        }
+                        let pick = egui::Button::new(format!("{}  {}", ph::FILE_ARROW_UP, t.pick_file));
+                        if ui.add_enabled(!checking, pick).on_hover_text(t.pick_file_tip).clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .set_title(format!("{} — {}", t.pick_file, m.file))
+                                .add_filter("safetensors", &["safetensors"]);
+                            if let Some(downloads) = std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Downloads")) {
+                                dialog = dialog.set_directory(downloads);
+                            }
+                            if let Some(src) = dialog.pick_file() {
+                                self.verifier.place(i, src, PathBuf::from(self.cfg.model_dir.trim()));
+                            }
+                        }
+                    });
                     ui.end_row();
                 }
             });

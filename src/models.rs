@@ -69,6 +69,16 @@ pub enum Status {
     Missing,
     /// Wrong size or hash (the file is not loaded).
     Mismatch,
+    /// A picked file is being copied into the model folder; fraction done.
+    Copying(f32),
+}
+
+/// Outcome of picking a file for a row, shown under its status.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Note {
+    /// The picked file is not the official one (size or SHA-256); nothing was written.
+    PickedMismatch,
+    PickedFailed(String),
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -93,6 +103,7 @@ pub fn model_path(dir: &Path, m: &ModelFile) -> PathBuf {
 
 struct State {
     status: [Status; 4],
+    notes: [Option<Note>; 4],
     dir: PathBuf,
     running: bool,
 }
@@ -112,6 +123,7 @@ impl Verifier {
         Self {
             state: Arc::new(Mutex::new(State {
                 status: std::array::from_fn(|_| Status::Unchecked),
+                notes: std::array::from_fn(|_| None),
                 dir: PathBuf::new(),
                 running: false,
             })),
@@ -124,6 +136,10 @@ impl Verifier {
 
     pub fn statuses(&self) -> [Status; 4] {
         self.state.lock().unwrap().status.clone()
+    }
+
+    pub fn notes(&self) -> [Option<Note>; 4] {
+        self.state.lock().unwrap().notes.clone()
     }
 
     pub fn running(&self) -> bool {
@@ -153,6 +169,7 @@ impl Verifier {
                 s.running = true;
                 s.dir = dir.clone();
                 s.status = std::array::from_fn(|_| Status::Unchecked);
+                s.notes = std::array::from_fn(|_| None);
             }
             me.run(&dir, gen);
             if !me.cancelled(gen) {
@@ -236,6 +253,124 @@ impl Verifier {
             self.set(i, Status::Checking(done as f32 / size.max(1) as f32));
         }
         Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// Use a file the user picked for model `i`: verify its size and SHA-256 first (nothing is written for a
+    /// file that does not match), then place it as `dir/<folder>/<file>` - a hard link when on the same drive
+    /// (no extra space, the original stays where it is), a copy otherwise.
+    pub fn place(&self, i: usize, src: PathBuf, dir: PathBuf) {
+        let gen = self.generation.load(Ordering::SeqCst);
+        self.state.lock().unwrap().running = true;
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let _guard = me.run_lock.lock().unwrap();
+            if me.cancelled(gen) {
+                return;
+            }
+            let before = {
+                let mut s = me.state.lock().unwrap();
+                s.notes[i] = None;
+                s.status[i].clone()
+            };
+            match me.place_file(i, &src, &dir, gen) {
+                Ok(()) => me.set(i, Status::Ok),
+                Err(note) => {
+                    me.set(i, before);
+                    if let Some(note) = note {
+                        me.state.lock().unwrap().notes[i] = Some(note);
+                    }
+                }
+            }
+            if !me.cancelled(gen) {
+                me.state.lock().unwrap().running = false;
+            }
+        });
+    }
+
+    /// Err(None) = cancelled.
+    fn place_file(&self, i: usize, src: &Path, dir: &Path, gen: u64) -> Result<(), Option<Note>> {
+        let m = &MODELS[i];
+        let dest = model_path(dir, m);
+        let fail = |what: String| {
+            self.log.error(format!("Model {}: {what}", m.file));
+            Some(Note::PickedFailed(what))
+        };
+        let (size, _) = stat(src).ok_or_else(|| fail(format!("cannot read {}", src.display())))?;
+        if size != m.size {
+            self.log.warn(format!("Picked {}: size {size} does not match {} ({}); not used", src.display(), m.file, m.size));
+            return Err(Some(Note::PickedMismatch));
+        }
+        self.log.info(format!("Model {}: checking the picked file {}", m.file, src.display()));
+        self.set(i, Status::Checking(0.0));
+        let sha = match self.hash(src, i, size, gen) {
+            Some(sha) => sha,
+            None if self.cancelled(gen) => return Err(None),
+            None => return Err(fail(format!("cannot read {}", src.display()))),
+        };
+        if sha != m.sha256 {
+            self.log.warn(format!("Picked {}: SHA-256 {sha} does not match the official file; not used", src.display()));
+            return Err(Some(Note::PickedMismatch));
+        }
+        let same = match (src.canonicalize(), dest.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if !same {
+            let folder = dest.parent().expect("model folder");
+            std::fs::create_dir_all(folder).map_err(|e| fail(format!("{}: {e}", folder.display())))?;
+            if dest.exists() {
+                // Keep whatever was there (it did not match) instead of deleting it.
+                let aside = dest.with_extension("safetensors.mismatch");
+                std::fs::rename(&dest, &aside).map_err(|e| fail(format!("{}: {e}", dest.display())))?;
+                self.log.warn(format!("Moved the previous {} aside to {}", m.file, aside.display()));
+            }
+            if std::fs::hard_link(src, &dest).is_ok() {
+                self.log.info(format!("Model {}: linked {} -> {}", m.file, src.display(), dest.display()));
+            } else {
+                self.copy(i, src, &dest, size, gen).map_err(|e| match e {
+                    Some(e) => fail(format!("copy to {}: {e}", dest.display())),
+                    None => None,
+                })?;
+                self.log.info(format!("Model {}: copied {} -> {}", m.file, src.display(), dest.display()));
+            }
+        }
+        let (dsize, mtime) = stat(&dest).ok_or_else(|| fail(format!("cannot read {}", dest.display())))?;
+        let mut cache = self.load_cache();
+        cache.insert(dest.display().to_string(), Seen { size: dsize, mtime, sha256: sha });
+        let _ = std::fs::write(&self.cache_path, serde_json::to_vec_pretty(&cache).unwrap_or_default());
+        self.log.info(format!("Model {}: match", m.file));
+        Ok(())
+    }
+
+    /// Copy through a temporary file, so a cancelled or failed copy never leaves a partial model file.
+    fn copy(&self, i: usize, src: &Path, dest: &Path, size: u64, gen: u64) -> Result<(), Option<String>> {
+        use std::io::Write;
+        let tmp = dest.with_extension("safetensors.part");
+        let result = (|| -> Result<(), Option<String>> {
+            let mut r = std::fs::File::open(src).map_err(|e| Some(e.to_string()))?;
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(|e| Some(e.to_string()))?);
+            let mut buf = vec![0u8; 8 << 20];
+            let mut done = 0u64;
+            loop {
+                if self.cancelled(gen) {
+                    return Err(None);
+                }
+                let n = r.read(&mut buf).map_err(|e| Some(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                w.write_all(&buf[..n]).map_err(|e| Some(e.to_string()))?;
+                done += n as u64;
+                self.set(i, Status::Copying(done as f32 / size.max(1) as f32));
+            }
+            w.flush().map_err(|e| Some(e.to_string()))?;
+            drop(w);
+            std::fs::rename(&tmp, dest).map_err(|e| Some(e.to_string()))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Right before a run: the files must still be the verified ones (same size and modification time).
