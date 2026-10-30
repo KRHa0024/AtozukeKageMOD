@@ -7,7 +7,7 @@ use egui_phosphor::regular as ph;
 use super::logic::failure_text;
 use super::settings::open_in_explorer;
 use super::{App, Phase, Screen};
-use crate::theme::{BLUE, GREEN, MUTED, RED, SIZE_ICON, STATE_OFF};
+use crate::theme::{spinner, BLUE, GREEN, MUTED, RED, SIZE_ICON, STATE_OFF};
 
 /// Progress fraction where the AI stage ends; the rest is subject mask, shadow layer and finishing.
 const AI_SHARE: f64 = 0.85;
@@ -64,13 +64,16 @@ impl App {
         let now = ui.input(|i| i.time);
         let running = self.running();
         let resolving = self.resolve.is_some();
-        let (icon, color) = match self.phase {
-            _ if running || resolving => (ph::CIRCLE_NOTCH, BLUE),
-            Phase::Done => (ph::CHECK_CIRCLE, GREEN),
-            Phase::Failed => (ph::WARNING_CIRCLE, RED),
-            _ => (ph::CIRCLE, STATE_OFF),
-        };
-        ui.label(RichText::new(icon).size(SIZE_ICON).color(color));
+        if running || resolving {
+            spinner(ui, BLUE);
+        } else {
+            let (icon, color) = match self.phase {
+                Phase::Done => (ph::CHECK_CIRCLE, GREEN),
+                Phase::Failed => (ph::WARNING_CIRCLE, RED),
+                _ => (ph::CIRCLE, STATE_OFF),
+            };
+            ui.label(RichText::new(icon).size(SIZE_ICON).color(color));
+        }
 
         let text = match self.phase {
             Phase::Running { .. } if self.waiting_comfy => t.waiting_comfy.to_string(),

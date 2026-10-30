@@ -10,7 +10,7 @@ use kage::models::{self, Status, MODELS};
 
 use super::{App, Screen, COMFY_TAB, MODELS_TAB};
 use crate::i18n::T;
-use crate::theme::{icon_button, text_field, AMBER, BLUE, CONTROL_HEIGHT, GAP, GREEN, LINE, MUTED, PADDING_I, RED, SECTION_GAP, SIZE_ICON, SIZE_TITLE, TEXT};
+use crate::theme::{icon_button, spinner, text_field, AMBER, BLUE, CONTROL_HEIGHT, GAP, GREEN, LINE, MUTED, PADDING_I, RED, SECTION_GAP, SIZE_ICON, SIZE_TITLE, TEXT};
 
 pub(super) const COMFY_RELEASES: &str = "https://github.com/comfyanonymous/ComfyUI/releases";
 /// Order of the tabs in the list: set up ComfyUI first, as the README says.
@@ -197,12 +197,12 @@ impl App {
         });
         for (i, m) in MODELS.iter().enumerate() {
             let (icon, color, text) = match &statuses[i] {
-                Status::Ok => (ph::CHECK_CIRCLE, GREEN, t.states[0].to_string()),
-                Status::Checking(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[1].replace("{}", &format!("{:.0}", f * 100.0))),
-                Status::Missing => (ph::CIRCLE_DASHED, AMBER, t.states[2].to_string()),
-                Status::Mismatch => (ph::X_CIRCLE, RED, t.states[3].to_string()),
-                Status::Unchecked => (ph::CIRCLE, MUTED, t.states[4].to_string()),
-                Status::Copying(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[5].replace("{}", &format!("{:.0}", f * 100.0))),
+                Status::Ok => (Some(ph::CHECK_CIRCLE), GREEN, t.states[0].to_string()),
+                Status::Checking(f) => (None, BLUE, t.states[1].replace("{}", &format!("{:.0}", f * 100.0))),
+                Status::Missing => (Some(ph::CIRCLE_DASHED), AMBER, t.states[2].to_string()),
+                Status::Mismatch => (Some(ph::X_CIRCLE), RED, t.states[3].to_string()),
+                Status::Unchecked => (Some(ph::CIRCLE), MUTED, t.states[4].to_string()),
+                Status::Copying(f) => (None, BLUE, t.states[5].replace("{}", &format!("{:.0}", f * 100.0))),
             };
             let note = match &notes[i] {
                 Some(models::Note::PickedMismatch) => Some(t.picked_mismatch.to_string()),
@@ -225,7 +225,12 @@ impl App {
                         ui.label(RichText::new(format!("{:.2} GB", m.size as f64 / 1e9)).monospace());
                     },
                     |ui| {
-                        ui.label(RichText::new(icon).size(SIZE_ICON).color(color));
+                        match icon {
+                            Some(icon) => {
+                                ui.label(RichText::new(icon).size(SIZE_ICON).color(color));
+                            }
+                            None => spinner(ui, color),
+                        }
                         ui.label(RichText::new(text).color(color)).on_hover_text(m.sha256);
                     },
                     |ui| {

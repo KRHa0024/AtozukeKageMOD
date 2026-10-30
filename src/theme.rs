@@ -47,6 +47,12 @@ pub const SIZE_TITLE: f32 = 16.0;
 pub const SIZE_ICON: f32 = 16.0;
 
 const RADIUS: u8 = 2;
+/// Radians per second.
+const SPINNER_SPEED: f64 = 5.0;
+/// Length of the arc in radians.
+const SPINNER_ARC: f32 = 4.5;
+const SPINNER_POINTS: usize = 24;
+const SPINNER_REPAINT: std::time::Duration = std::time::Duration::from_millis(33);
 
 pub fn radius() -> CornerRadius {
     CornerRadius::same(RADIUS)
@@ -75,6 +81,16 @@ pub fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
         ui.add_sized([CONTROL_HEIGHT, CONTROL_HEIGHT], egui::Button::new(RichText::new(icon).size(SIZE_ICON)))
     })
     .inner
+}
+
+/// A turning arc for work in progress, as large as an icon. It repaints slowly: a run has the GPU busy with the AI.
+pub fn spinner(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(SIZE_ICON), egui::Sense::hover());
+    let start = (ui.input(|i| i.time) * SPINNER_SPEED).rem_euclid(std::f64::consts::TAU) as f32;
+    let r = rect.width() / 2.0 - 2.0;
+    let points = (0..=SPINNER_POINTS).map(|i| rect.center() + r * Vec2::angled(start + i as f32 / SPINNER_POINTS as f32 * SPINNER_ARC)).collect();
+    ui.painter().add(egui::Shape::line(points, Stroke::new(1.5, color)));
+    ui.ctx().request_repaint_after(SPINNER_REPAINT);
 }
 
 /// The frame of a dialog.

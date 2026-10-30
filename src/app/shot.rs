@@ -13,6 +13,8 @@ use crate::i18n::Lang;
 pub(super) struct Shot {
     out: PathBuf,
     frame: u32,
+    /// Take the shot at this frame, whatever is going on: shows work in progress.
+    at_frame: Option<u32>,
     /// Waiting for a run to finish before taking the shot.
     auto: Option<String>,
     started: bool,
@@ -41,6 +43,7 @@ impl App {
         self.shot = Some(Shot {
             out: out.into(),
             frame: 0,
+            at_frame: std::env::var("KAGE_SHOT_FRAME").ok().and_then(|v| v.parse().ok()),
             auto: std::env::var("KAGE_AUTO").ok(),
             started: false,
             done_frame: None,
@@ -131,7 +134,7 @@ impl App {
                 shot.done_frame.is_some_and(|f| shot.frame == f + 30)
             }
         };
-        if take {
+        if shot.at_frame.map_or(take, |frame| shot.frame == frame) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
         let events = ctx.input(|i| i.raw.events.clone());
