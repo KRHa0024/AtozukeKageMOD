@@ -1,12 +1,12 @@
 //! Right panel: the layer list and the history of runs.
 
-use eframe::egui::{self, Align2, Color32, FontId, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureId, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Frame, Id, Margin, Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Vec2};
 use egui_phosphor::regular as ph;
 use kage::blend::{AI, MENU_ORDER, ORIGINAL, SHADOW};
 
 use super::App;
 use crate::i18n::Lang;
-use crate::theme::{radius, BLUE, CONTROL_EDGE, HOVER, LINE, LINE_DARK, MUTED, SEL, SIZE_BODY, SIZE_ICON, SIZE_SMALL, SLOT, STATE_OFF, TEXT};
+use crate::theme::{primary_button, radius, BLUE, HOVER, LINE, LINE_DARK, MUTED, PANEL, SEL, SIZE_BODY, SIZE_ICON, SIZE_SMALL, SIZE_TITLE, SLOT, STATE_OFF, TEXT};
 
 const LAYER_ROW: f32 = 58.0;
 const HISTORY_ROW: f32 = 74.0;
@@ -14,7 +14,7 @@ const LAYER_THUMB: f32 = 48.0;
 /// Space for the longest value in the property rows.
 const VALUE_WIDTH: f32 = 66.0;
 const PROP_LABEL_WIDTH: f32 = 64.0;
-const STRENGTH_DEFAULT: f32 = 1.0;
+const ACTION_HEIGHT: f32 = 48.0;
 const PROP_GAP: f32 = 10.0;
 
 fn fit_thumb(painter: &egui::Painter, tex: TextureId, size: Vec2, slot: Rect, tint: Color32) {
@@ -27,6 +27,18 @@ fn fit_thumb(painter: &egui::Painter, tex: TextureId, size: Vec2, slot: Rect, ti
 impl App {
     pub(super) fn right_panel(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
+        // The end of the work, level with Generate on the other side.
+        let action = Frame::new().fill(PANEL).inner_margin(Margin { left: 0, right: 0, top: 10, bottom: 2 });
+        egui::Panel::bottom("export_action").frame(action).show(ui, |ui| {
+            let has_result = self.current.is_some();
+            let can_export = has_result && self.export_rx.is_none() && !self.export_pending;
+            let main_action = has_result && !self.running() && self.unapplied(t).is_empty();
+            let export = primary_button(format!("{}  {}", ph::DOWNLOAD_SIMPLE, t.export), SIZE_TITLE, main_action);
+            let w = ui.available_width();
+            if ui.add_enabled_ui(can_export, |ui| ui.add_sized([w, ACTION_HEIGHT], export)).inner.on_hover_text(t.export_tip).clicked() {
+                self.export_open = true;
+            }
+        });
         ui.horizontal(|ui| {
             for (i, label) in [t.tab_layers, t.history].into_iter().enumerate() {
                 if ui.add(egui::Button::new(label).selected(self.right_tab == i).min_size(Vec2::new(96.0, 26.0))).clicked() {
@@ -41,29 +53,6 @@ impl App {
             }
             _ => self.history(ui),
         }
-    }
-
-    /// The adjustments that re-solve the shadow layer without a new AI run.
-    fn adjustments(&mut self, ui: &mut egui::Ui, field: f32) {
-        let t = self.t();
-        ui.label(RichText::new(t.adjust_title).strong());
-        egui::Grid::new("adjust").num_columns(2).spacing([PROP_GAP, 8.0]).min_col_width(PROP_LABEL_WIDTH).show(ui, |ui| {
-            let label = ui.add(egui::Label::new(t.strength).sense(Sense::click()));
-            if label.on_hover_text(format!("{}\n{}", t.strength_tip, t.reset_tip)).double_clicked() {
-                self.cfg.strength = STRENGTH_DEFAULT;
-            }
-            ui.horizontal(|ui| {
-                ui.spacing_mut().slider_width = field - VALUE_WIDTH - ui.spacing().item_spacing.x;
-                let slider = ui.add(egui::Slider::new(&mut self.cfg.strength, 0.5..=1.5).step_by(0.05).show_value(false));
-                // The neutral value.
-                ui.painter().vline(slider.rect.center().x, slider.rect.y_range(), Stroke::new(1.0, CONTROL_EDGE));
-                ui.add_sized([VALUE_WIDTH, 22.0], egui::DragValue::new(&mut self.cfg.strength).range(0.5..=1.5).speed(0.01).fixed_decimals(2).prefix("× "));
-            });
-            ui.end_row();
-        });
-        ui.checkbox(&mut self.cfg.bg_shadow, t.bg_shadow).on_hover_text(t.bg_tip);
-        ui.checkbox(&mut self.cfg.gray, t.gray).on_hover_text(t.gray_tip);
-        ui.checkbox(&mut self.cfg.ghost, t.ghost).on_hover_text(t.ghost_desc);
     }
 
     /// Eye click: toggle. Alt+click: this layer alone; on the same layer again, back to what was visible before.
@@ -129,8 +118,6 @@ impl App {
             });
             ui.end_row();
         });
-        ui.separator();
-        self.adjustments(ui, field);
         ui.separator();
 
         let mut select = None;

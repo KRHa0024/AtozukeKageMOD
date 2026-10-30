@@ -68,7 +68,7 @@ impl App {
         }
     }
 
-    fn warn(&mut self, ctx: &egui::Context, text: &str) {
+    pub(super) fn warn(&mut self, ctx: &egui::Context, text: &str) {
         self.toast = Some(Toast { ok: false, text: text.into(), at: ctx.input(|i| i.time), folder: None });
     }
 

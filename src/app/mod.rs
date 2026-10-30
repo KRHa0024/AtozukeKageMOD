@@ -296,6 +296,7 @@ impl eframe::App for App {
                 egui::Panel::left("controls").frame(side).exact_size(270.0).resizable(false).show_separator_line(false).show(ui, |ui| self.controls(ui));
                 self.ensure_views(&ctx);
                 egui::Panel::right("right").frame(padded).exact_size(280.0).resizable(false).show_separator_line(false).show(ui, |ui| self.right_panel(ui));
+                egui::Panel::bottom("view_tools").frame(bar).exact_size(36.0).show(ui, |ui| self.view_tools(ui));
                 let canvas = Frame::new().fill(CANVAS_SHADES[self.cfg.canvas_shade]);
                 egui::CentralPanel::default().frame(canvas).show(ui, |ui| self.canvas(ui));
                 if self.export_open {

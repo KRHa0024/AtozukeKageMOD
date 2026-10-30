@@ -12,7 +12,7 @@ use super::{App, Screen, COMFY_TAB, MODELS_TAB};
 use crate::i18n::T;
 use crate::theme::{AMBER, BLUE, GREEN, LINE, MUTED, RED, SIZE_ICON, SIZE_TITLE, TEXT};
 
-const COMFY_RELEASES: &str = "https://github.com/comfyanonymous/ComfyUI/releases";
+pub(super) const COMFY_RELEASES: &str = "https://github.com/comfyanonymous/ComfyUI/releases";
 /// Order of the tabs in the list: set up ComfyUI first, as the README says.
 const NAV_ORDER: [usize; 3] = [COMFY_TAB, MODELS_TAB, 2];
 const NAV_DOT_RADIUS: f32 = 4.0;
@@ -89,6 +89,22 @@ impl App {
         }
     }
 
+    /// Several downloaded files at once: sorted by name, each verified before it is used.
+    fn pick_model_files(&mut self, ctx: &egui::Context) {
+        let t = self.t();
+        let mut dialog = rfd::FileDialog::new().set_title(t.pick_many).add_filter("safetensors", &["safetensors"]);
+        if let Some(downloads) = std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Downloads")) {
+            dialog = dialog.set_directory(downloads);
+        }
+        let Some(files) = dialog.pick_files() else { return };
+        let (known, unknown): (Vec<_>, Vec<_>) = files.into_iter().partition(|p| models::index_of_file(p).is_some());
+        if !unknown.is_empty() {
+            self.warn(ctx, &t.picked_unknown.replace("{}", &unknown.len().to_string()));
+        }
+        let picks = known.into_iter().filter_map(|p| Some((models::index_of_file(&p)?, p))).collect();
+        self.verifier.place_many(picks, PathBuf::from(self.cfg.model_dir.trim()));
+    }
+
     fn models_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {
         let statuses = self.verifier.statuses();
         let notes = self.verifier.notes();
@@ -134,6 +150,11 @@ impl App {
                 open_in_explorer(&dir);
             }
         });
+        ui.add_space(8.0);
+        let pick_many = egui::Button::new(format!("{}  {}", ph::FILE_ARROW_UP, t.pick_many));
+        if ui.add_enabled(!checking, pick_many).on_hover_text(t.pick_many_tip).clicked() {
+            self.pick_model_files(ui.ctx());
+        }
         ui.add_space(8.0);
         Frame::new().fill(egui::Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::same(6)).show(ui, |ui| {
             egui::Grid::new("models").num_columns(4).spacing([14.0, 8.0]).show(ui, |ui| {
@@ -278,7 +299,7 @@ impl App {
     }
 
     /// The chosen ComfyUI's own models directory, when it holds all the files and is not in use yet.
-    fn comfy_models_to_use(&self) -> Option<PathBuf> {
+    pub(super) fn comfy_models_to_use(&self) -> Option<PathBuf> {
         let install = comfy::detect(Path::new(self.cfg.comfy_dir.trim()))?;
         let dir = install.main_py.parent()?.join("models");
         (dir != Path::new(self.cfg.model_dir.trim()) && models::all_present(&dir)).then_some(dir)

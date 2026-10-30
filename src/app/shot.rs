@@ -19,8 +19,9 @@ pub(super) struct Shot {
     done_frame: Option<u32>,
     /// Show only this layer (and this blend mode) before the shot.
     solo: Option<(usize, Option<usize>)>,
-    /// After the run: change the strength (re-solve), then export.
+    /// After the run: change the strength (re-solve), switch the background, then export.
     resolve: Option<f32>,
+    background: Option<bool>,
     export: bool,
 }
 
@@ -45,6 +46,7 @@ impl App {
             done_frame: None,
             solo,
             resolve: std::env::var("KAGE_RESOLVE").ok().and_then(|v| v.parse().ok()),
+            background: std::env::var("KAGE_BG_AFTER").ok().map(|v| v == "1"),
             export: std::env::var("KAGE_EXPORT").is_ok(),
         });
         if std::env::var("KAGE_LANG").as_deref() == Ok("en") {
@@ -91,17 +93,19 @@ impl App {
                     shot.started = true;
                     start = Some(auto.clone());
                 }
-                let shown_strength = self.current.and_then(|id| self.history.iter().find(|e| e.id == id)).map(|e| e.result.params.strength);
+                let shown = self.entry(self.current).map(|e| (e.result.params.strength, e.result.params.background));
                 let drawn = self.views.as_ref().is_none_or(|v| v.shown.is_some() && !v.busy());
                 let settled = matches!(self.phase, Phase::Done | Phase::Failed)
                     && self.resolve.is_none()
                     && self.export_rx.is_none()
                     && !self.export_pending
                     && drawn
-                    && (shown_strength.is_none() || shown_strength == Some(self.cfg.strength));
+                    && (shown.is_none() || shown == Some((self.cfg.strength, self.cfg.bg_shadow)));
                 if shot.done_frame.is_none() && settled {
                     if let Some(k) = shot.resolve.take() {
                         self.cfg.strength = k;
+                    } else if let Some(background) = shot.background.take() {
+                        self.cfg.bg_shadow = background;
                     } else if shot.export {
                         shot.export = false;
                         export = true;

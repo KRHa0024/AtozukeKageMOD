@@ -35,6 +35,11 @@ fn main() {
         wait(&v);
         println!("{what}: status {:?} note {:?} wrote anything: {}", v.statuses()[i], v.notes()[i], empty.exists());
     }
+    // Several files at once: the wrong one changes nothing, the official one is still placed.
+    let many = scratch.join("many_models");
+    v.place_many(vec![(i, fake.clone()), (i, official.clone())], many.clone());
+    wait(&v);
+    println!("several files: status {:?} note {:?} placed {}", v.statuses()[i], v.notes()[i], model_path(&many, &MODELS[i]).is_file());
     let (_, lines) = log.snapshot();
     for l in lines {
         println!("  {} {}", l.level.tag(), l.text);
