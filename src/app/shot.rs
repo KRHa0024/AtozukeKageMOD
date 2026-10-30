@@ -1,4 +1,4 @@
-//! Self-screenshot for checking the layout (see CLAUDE.md): renders a scene, saves a PNG and exits.
+//! Self-screenshot for checking the layout: renders a scene, saves a PNG and exits.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
