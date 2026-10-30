@@ -150,14 +150,15 @@ impl App {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(t.model_folder);
-            let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.model_dir).desired_width(ui.available_width() - 62.0).font(egui::TextStyle::Monospace));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.model_dir).desired_width(ui.available_width() - 40.0).font(egui::TextStyle::Monospace));
             if r.lost_focus() {
                 self.apply_dirs();
             }
-            if ui.button(t.open).on_hover_text(t.open_folder_tip).clicked() {
-                let dir = PathBuf::from(self.cfg.model_dir.trim());
-                let _ = models::prepare_dir(&dir);
-                open_in_explorer(&dir);
+            if ui.button(RichText::new(ph::FOLDER_OPEN).size(SIZE_ICON)).on_hover_text(t.choose_model_dir).clicked() {
+                if let Some(dir) = rfd::FileDialog::new().set_title(t.choose_model_dir).set_directory(self.cfg.model_dir.trim()).pick_folder() {
+                    self.cfg.model_dir = dir.display().to_string();
+                    self.apply_dirs();
+                }
             }
         });
         ui.add_space(12.0);
