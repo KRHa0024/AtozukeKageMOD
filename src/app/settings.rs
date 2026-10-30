@@ -264,13 +264,13 @@ impl App {
         if state == comfy::State::Starting {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
         }
-        ui.label(RichText::new("ComfyUI").strong().size(SIZE_TITLE));
         ui.horizontal(|ui| {
-            ui.label(RichText::new(t.comfy_install).color(MUTED));
+            ui.label(RichText::new("ComfyUI").strong().size(SIZE_TITLE));
             if ui.button(format!("{}  {}", ph::LINK, t.source_page)).on_hover_text(COMFY_RELEASES).clicked() {
                 open_in_explorer(Path::new(COMFY_RELEASES));
             }
         });
+        ui.label(RichText::new(t.comfy_install).color(MUTED));
         ui.add_space(8.0);
         egui::Grid::new("comfy").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
             ui.label(t.location);
@@ -279,8 +279,8 @@ impl App {
                 if r.lost_focus() {
                     self.apply_dirs();
                 }
-                if ui.button(t.browse).clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if ui.button(RichText::new(ph::FOLDER_OPEN).size(SIZE_ICON)).on_hover_text(t.choose_comfy_dir).clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().set_title(t.choose_comfy_dir).pick_folder() {
                         self.cfg.comfy_dir = dir.display().to_string();
                         self.apply_dirs();
                     }
