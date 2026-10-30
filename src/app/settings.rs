@@ -19,6 +19,40 @@ const NAV_DOT_RADIUS: f32 = 4.0;
 /// Long explanations stay readable on wide windows.
 const TEXT_WIDTH: f32 = 640.0;
 const CONTENT_MIN_WIDTH: f32 = 720.0;
+const SIZE_COLUMN: f32 = 70.0;
+const STATE_COLUMN: f32 = 170.0;
+const ACTIONS_COLUMN: f32 = 240.0;
+const HEADER_HEIGHT: f32 = 20.0;
+const ROW_HEIGHT: f32 = 36.0;
+const MIN_FILE_COLUMN: f32 = 120.0;
+const ROW_MARGIN: i8 = 8;
+
+/// One line of the model list: file (takes what is left), size, state, actions.
+fn model_columns(
+    ui: &mut egui::Ui,
+    height: f32,
+    file: impl FnOnce(&mut egui::Ui),
+    size: impl FnOnce(&mut egui::Ui),
+    state: impl FnOnce(&mut egui::Ui),
+    actions: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        let gaps = ui.spacing().item_spacing.x * 3.0;
+        let rest = (ui.available_width() - SIZE_COLUMN - STATE_COLUMN - ACTIONS_COLUMN - gaps).max(MIN_FILE_COLUMN);
+        for (width, cell) in [
+            (rest, Box::new(file) as Box<dyn FnOnce(&mut egui::Ui) + '_>),
+            (SIZE_COLUMN, Box::new(size)),
+            (STATE_COLUMN, Box::new(state)),
+            (ACTIONS_COLUMN, Box::new(actions)),
+        ] {
+            ui.allocate_ui_with_layout(egui::vec2(width, height), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_width(width);
+                ui.set_height(height);
+                cell(ui);
+            });
+        }
+    });
+}
 
 /// A directory or file in Explorer, or a URL in the browser.
 pub(super) fn open_in_explorer(target: &Path) {
@@ -131,42 +165,60 @@ impl App {
         self.model_layout(ui);
         ui.add_space(12.0);
         ui.label(RichText::new(t.pick_title).strong());
-        ui.label(RichText::new(t.pick_note).color(MUTED));
-        Frame::new().fill(egui::Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::same(6)).show(ui, |ui| {
-            egui::Grid::new("models").num_columns(4).spacing([14.0, 8.0]).show(ui, |ui| {
-                for h in ["", t.col_file, t.col_hash, t.col_source] {
-                    ui.label(RichText::new(h).color(MUTED));
-                }
-                ui.end_row();
-                for (i, m) in MODELS.iter().enumerate() {
-                    let (icon, color, text) = match &statuses[i] {
-                        Status::Ok => (ph::CHECK_CIRCLE, GREEN, t.states[0].to_string()),
-                        Status::Checking(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[1].replace("{}", &format!("{:.0}", f * 100.0))),
-                        Status::Missing => (ph::CIRCLE_DASHED, AMBER, t.states[2].to_string()),
-                        Status::Mismatch => (ph::X_CIRCLE, RED, t.states[3].to_string()),
-                        Status::Unchecked => (ph::CIRCLE, MUTED, t.states[4].to_string()),
-                        Status::Copying(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[5].replace("{}", &format!("{:.0}", f * 100.0))),
-                    };
-                    ui.label(RichText::new(icon).size(SIZE_ICON).color(color));
-                    // Grid columns keep the width of their first layout, so cells must not wrap.
-                    ui.vertical(|ui| {
-                        ui.add(egui::Label::new(t.purposes[i]).extend());
-                        ui.add(egui::Label::new(RichText::new(m.file).monospace().color(MUTED)).extend());
-                        ui.add(egui::Label::new(RichText::new(format!("{:.2} GB", m.size as f64 / 1e9)).monospace().color(MUTED)).extend());
-                    });
-                    let note = match &notes[i] {
-                        Some(models::Note::PickedMismatch) => Some(t.picked_mismatch.to_string()),
-                        Some(models::Note::PickedFailed(e)) => Some(t.picked_failed.replace("{}", e)),
-                        None => None,
-                    };
-                    let state = egui::Label::new(RichText::new(text).color(color)).extend();
-                    ui.vertical(|ui| {
-                        ui.add(state).on_hover_text(m.sha256);
-                        if let Some(note) = note {
-                            ui.add(egui::Label::new(RichText::new(note).small().color(RED)).extend());
-                        }
-                    });
-                    ui.vertical(|ui| {
+        ui.add_space(2.0);
+        let header = Frame::new().inner_margin(Margin::symmetric(ROW_MARGIN, 0));
+        header.show(ui, |ui| {
+            model_columns(
+            ui,
+            HEADER_HEIGHT,
+            |ui| {
+                ui.label(RichText::new(t.col_file).color(MUTED));
+            },
+            |ui| {
+                ui.label(RichText::new(t.col_size).color(MUTED));
+            },
+            |ui| {
+                ui.label(RichText::new(t.col_hash).color(MUTED));
+            },
+            |ui| {
+                ui.label(RichText::new(t.col_source).color(MUTED));
+            },
+            );
+        });
+        for (i, m) in MODELS.iter().enumerate() {
+            let (icon, color, text) = match &statuses[i] {
+                Status::Ok => (ph::CHECK_CIRCLE, GREEN, t.states[0].to_string()),
+                Status::Checking(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[1].replace("{}", &format!("{:.0}", f * 100.0))),
+                Status::Missing => (ph::CIRCLE_DASHED, AMBER, t.states[2].to_string()),
+                Status::Mismatch => (ph::X_CIRCLE, RED, t.states[3].to_string()),
+                Status::Unchecked => (ph::CIRCLE, MUTED, t.states[4].to_string()),
+                Status::Copying(f) => (ph::CIRCLE_NOTCH, BLUE, t.states[5].replace("{}", &format!("{:.0}", f * 100.0))),
+            };
+            let note = match &notes[i] {
+                Some(models::Note::PickedMismatch) => Some(t.picked_mismatch.to_string()),
+                Some(models::Note::PickedFailed(e)) => Some(t.picked_failed.replace("{}", e)),
+                None => None,
+            };
+            Frame::new().fill(egui::Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::symmetric(ROW_MARGIN, 5)).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                model_columns(
+                    ui,
+                    ROW_HEIGHT,
+                    |ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add(egui::Label::new(RichText::new(m.file).monospace()).truncate()).on_hover_text(m.file);
+                            ui.label(RichText::new(t.purposes[i]).small().color(MUTED));
+                        });
+                    },
+                    |ui| {
+                        ui.label(RichText::new(format!("{:.2} GB", m.size as f64 / 1e9)).monospace());
+                    },
+                    |ui| {
+                        ui.label(RichText::new(icon).size(SIZE_ICON).color(color));
+                        ui.label(RichText::new(text).color(color)).on_hover_text(m.sha256);
+                    },
+                    |ui| {
                         if ui.button(format!("{}  {}", ph::LINK, t.source_page)).on_hover_text(m.source).clicked() {
                             open_in_explorer(Path::new(m.source));
                         }
@@ -180,11 +232,15 @@ impl App {
                                 self.verifier.place(i, src, PathBuf::from(self.cfg.model_dir.trim()));
                             }
                         }
-                    });
-                    ui.end_row();
+                    },
+                );
+                if let Some(note) = note {
+                    ui.add(egui::Label::new(RichText::new(note).small().color(RED)).wrap());
                 }
             });
-        });
+        }
+        ui.add_space(2.0);
+        ui.label(RichText::new(t.pick_note).color(MUTED));
     }
 
     /// The directory tree the models have to be in.
