@@ -139,7 +139,6 @@ pub struct T {
     pub log_button: &'static str,
     pub log_tip: &'static str,
     pub export_targets: [&'static str; 3],
-    pub psd_contents: &'static str,
     pub composite_contents: &'static str,
     /// Around a value, and between items.
     pub paren: (&'static str, &'static str),
@@ -333,7 +332,6 @@ pub static JA: T = T {
     log_button: "Log",
     log_tip: "設定画面で詳しいログを見る",
     export_targets: ["影レイヤー", "AI の出力", "合成結果"],
-    psd_contents: "レイヤー付き PSD を 1 ファイル書き出します（影・AI の出力・元画像）",
     composite_contents: "合成結果の内容",
     paren: ("（", "）"),
     plus: " ＋ ",
@@ -526,7 +524,6 @@ pub static EN: T = T {
     log_button: "Log",
     log_tip: "Open the detailed log in Settings",
     export_targets: ["Shadow layer", "AI output", "Composite"],
-    psd_contents: "One layered PSD file (shadow, AI output, original)",
     composite_contents: "Composite contains",
     paren: (" (", ")"),
     plus: " + ",

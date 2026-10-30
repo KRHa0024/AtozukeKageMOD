@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::export::FORMATS;
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -78,7 +80,8 @@ impl Config {
         self.comfy_dir = self.comfy_dir.trim().to_string();
         self.light_dir = self.light_dir.min(8);
         self.strength = if self.strength.is_finite() { self.strength.clamp(0.5, 1.5) } else { 1.0 };
-        self.export_format = self.export_format.min(3);
+        // Index 3 was PSD.
+        self.export_format = if self.export_format < FORMATS.len() { self.export_format } else { 0 };
         self.png_level = self.png_level.min(9);
         self.quality = self.quality.clamp(1, 100);
         self.blend = self.blend.min(7);

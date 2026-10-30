@@ -381,7 +381,7 @@ impl App {
         let Some(e) = self.entry(self.current) else { return };
         let targets = self.cfg.export_targets;
         let format = FORMATS[self.cfg.export_format];
-        if format != export::Format::Psd && !targets.iter().any(|&x| x) {
+        if !targets.iter().any(|&x| x) {
             self.warn(ctx, t.nothing_to_export);
             return;
         }
@@ -405,7 +405,6 @@ impl App {
                 encoding,
                 dir: &dir,
                 stem: &stem,
-                names: t.layer_names,
             });
             for p in &outcome.written {
                 log.info(format!("Exported {}", p.display()));

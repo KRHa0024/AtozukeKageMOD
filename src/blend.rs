@@ -44,20 +44,6 @@ pub const MODES: [Mode; 8] = [
 pub const MENU_ORDER: [usize; 8] = [7, 0, 1, 2, 3, 4, 5, 6];
 
 impl Mode {
-    /// PSD blend-mode key.
-    pub fn psd_key(self) -> &'static [u8; 4] {
-        match self {
-            Mode::Multiply => b"mul ",
-            Mode::ColorBurn => b"idiv",
-            Mode::LinearBurn => b"lbrn",
-            Mode::Darken => b"dark",
-            Mode::Overlay => b"over",
-            Mode::SoftLight => b"sLit",
-            Mode::HardLight => b"hLit",
-            Mode::Normal => b"norm",
-        }
-    }
-
     /// Blend of base `b` and layer `l` (0..1).
     fn apply(self, b: f32, l: f32) -> f32 {
         match self {
@@ -199,7 +185,7 @@ pub fn flatten(stack: &Stack, pixels: usize) -> Vec<u8> {
         };
         let mut shaded = [b[0], b[1], b[2]];
         if source_alpha != 255 && over_ai {
-            // Over the AI layer the shadow fades out with the silhouette (a layer with alpha, as in the PSD).
+            // Over the AI layer the shadow fades out with the silhouette (like a layer with the source's alpha).
             for c in 0..3 {
                 shaded[c] = (d[c] as f32 + (b[c] as f32 - d[c] as f32) * keep + 0.5) as u8;
             }

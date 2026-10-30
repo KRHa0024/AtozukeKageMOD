@@ -1,18 +1,17 @@
-//! Saving the results: PNG (lossless, compression level), JPEG / WebP (quality) and layered PSD.
+//! Saving the results: PNG (lossless, compression level), JPEG / WebP (quality).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use image::ImageEncoder;
 
-use crate::blend::{self, Mode, View, AI, ORIGINAL, SHADOW};
+use crate::blend::{self, Mode, View};
 use crate::resample::{self, Filter};
 use crate::shading::{Image8, Layers};
 
 /// WebP's limit per side.
 const WEBP_MAX_SIDE: usize = 16383;
 const JPEG_MAX_SIDE: usize = 65535;
-const PSD_MAX_SIDE: usize = 30000;
 /// WebP at this quality is written lossless.
 const WEBP_LOSSLESS_QUALITY: u8 = 100;
 
@@ -21,10 +20,9 @@ pub enum Format {
     Png,
     Jpeg,
     Webp,
-    Psd,
 }
 
-pub const FORMATS: [Format; 4] = [Format::Png, Format::Jpeg, Format::Webp, Format::Psd];
+pub const FORMATS: [Format; 3] = [Format::Png, Format::Jpeg, Format::Webp];
 
 impl Format {
     pub fn ext(self) -> &'static str {
@@ -32,7 +30,6 @@ impl Format {
             Format::Png => "png",
             Format::Jpeg => "jpg",
             Format::Webp => "webp",
-            Format::Psd => "psd",
         }
     }
 }
@@ -94,7 +91,7 @@ fn check_size(w: usize, h: usize, max: usize, format: &str) -> Result<(), String
     Ok(())
 }
 
-/// The file's bytes for a PNG, JPEG or WebP. `icc` is embedded when given (RGB profiles: not for gray pixels).
+/// The file's bytes. `icc` is embedded when given (RGB profiles: not for gray pixels).
 pub fn encode(px: &Pixels, enc: &Encoding, icc: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let (w, h) = (px.w as u32, px.h as u32);
     let quality = enc.quality.clamp(1, 100);
@@ -149,7 +146,6 @@ pub fn encode(px: &Pixels, enc: &Encoding, icc: Option<&[u8]>) -> Result<Vec<u8>
                 None => encoded,
             };
         }
-        Format::Psd => return Err("use save_psd".into()),
     }
     Ok(out)
 }
@@ -226,13 +222,11 @@ pub struct Job<'a> {
     pub ai_full: &'a [u8],
     pub layers: &'a Layers,
     pub view: View,
-    /// Shadow layer, AI output, composite (PSD always holds all three).
+    /// Shadow layer, AI output, composite.
     pub targets: [bool; 3],
     pub encoding: Encoding,
     pub dir: &'a Path,
     pub stem: &'a str,
-    /// Layer names in the PSD (shadow, AI output, original).
-    pub names: [&'a str; 3],
 }
 
 /// Written files, and the error that stopped the rest.
@@ -244,9 +238,6 @@ pub struct Outcome {
 
 /// File names a job writes in an empty directory (for showing them before exporting).
 pub fn planned_names(stem: &str, targets: [bool; 3], format: Format) -> Vec<String> {
-    if format == Format::Psd {
-        return vec![format!("{stem}_kage.psd")];
-    }
     ["shadow", "ai", "shaded"].iter().zip(targets).filter(|(_, on)| *on).map(|(s, _)| format!("{stem}_{s}.{}", format.ext())).collect()
 }
 
@@ -259,29 +250,11 @@ pub fn run_job(job: &Job) -> Outcome {
 }
 
 fn write_files(job: &Job, written: &mut Vec<PathBuf>) -> Result<(), String> {
-    let Job { original, shaded, ai_full, layers, view, targets, encoding, dir, stem, names } = job;
+    let Job { original, shaded, ai_full, layers, view, targets, encoding, dir, stem } = job;
     let (w, h) = (layers.w, layers.h);
     let format = encoding.format;
     let icc = original.icc.as_ref().map(|p| p.as_slice());
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    if format == Format::Psd {
-        let psd_layers = [
-            PsdLayer { name: names[ORIGINAL], rgba: original.rgba.clone(), mode: None, opacity: 1.0, visible: view.visible[ORIGINAL] },
-            PsdLayer { name: names[AI], rgba: ai_full.to_vec(), mode: None, opacity: view.opacity[AI], visible: view.visible[AI] },
-            PsdLayer {
-                name: names[SHADOW],
-                rgba: blend::shadow_rgba(layers, view.mode, &original.rgba),
-                mode: Some(view.mode),
-                opacity: view.opacity[SHADOW],
-                visible: view.visible[SHADOW],
-            },
-        ];
-        let composite = blend::flatten_view(original, ai_full, layers, view);
-        let path = unique_path(dir, stem, "kage", "psd");
-        save_psd(&path, w, h, &psd_layers, &composite, icc)?;
-        written.push(path);
-        return Ok(());
-    }
     let ext = format.ext();
     if targets[0] {
         let path = unique_path(dir, stem, "shadow", ext);
@@ -308,225 +281,8 @@ fn write_files(job: &Job, written: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-pub struct PsdLayer<'a> {
-    pub name: &'a str,
-    /// RGBA, canvas size.
-    pub rgba: Vec<u8>,
-    pub mode: Option<Mode>,
-    pub opacity: f32,
-    pub visible: bool,
-}
-
-/// Layered PSD (8-bit RGB, RLE). `merged` is the flattened result shown by viewers without layer support (over white,
-/// as it has no alpha).
-pub fn save_psd(path: &Path, w: usize, h: usize, layers: &[PsdLayer], merged: &[u8], icc: Option<&[u8]>) -> Result<(), String> {
-    check_size(w, h, PSD_MAX_SIDE, "PSD")?;
-    let mut f = Vec::<u8>::new();
-    f.extend_from_slice(b"8BPS");
-    be16(&mut f, 1);
-    f.extend_from_slice(&[0; 6]);
-    be16(&mut f, 3); // merged image channels
-    be32(&mut f, h as u32);
-    be32(&mut f, w as u32);
-    be16(&mut f, 8);
-    be16(&mut f, 3); // RGB
-    be32(&mut f, 0); // color mode data
-    let mut resources = Vec::new();
-    if let Some(icc) = icc {
-        resources.extend_from_slice(b"8BIM");
-        be16(&mut resources, 1039); // ICC profile
-        be16(&mut resources, 0); // empty name
-        be32(&mut resources, icc.len() as u32);
-        resources.extend_from_slice(icc);
-        if icc.len() % 2 != 0 {
-            resources.push(0);
-        }
-    }
-    be32(&mut f, resources.len() as u32);
-    f.extend(resources);
-
-    // Layer records and channel data.
-    let mut records = Vec::new();
-    let mut channel_data = Vec::new();
-    for layer in layers {
-        let mut chans: Vec<(i16, Vec<u8>)> = Vec::new();
-        // R, G, B, then alpha, each padded to an even length: valid PSD, and also what simpler readers (Pillow)
-        // expect.
-        for (id, c) in [(0i16, 0usize), (1, 1), (2, 2), (-1, 3)] {
-            let plane: Vec<u8> = layer.rgba.iter().skip(c).step_by(4).copied().collect();
-            let mut data = Vec::new();
-            be16(&mut data, 1); // RLE
-            data.extend(rle_plane(&plane, w, h));
-            if data.len() % 2 != 0 {
-                data.push(0);
-            }
-            chans.push((id, data));
-        }
-        be32(&mut records, 0);
-        be32(&mut records, 0);
-        be32(&mut records, h as u32);
-        be32(&mut records, w as u32);
-        be16(&mut records, chans.len() as u16);
-        for (id, data) in &chans {
-            be16(&mut records, *id as u16);
-            be32(&mut records, data.len() as u32);
-        }
-        records.extend_from_slice(b"8BIM");
-        records.extend_from_slice(layer.mode.map(|m| m.psd_key()).unwrap_or(b"norm"));
-        records.push((layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u8);
-        records.push(0); // clipping
-        records.push(if layer.visible { 0 } else { 2 }); // flags: bit 1 = hidden
-        records.push(0);
-        let mut extra = Vec::new();
-        be32(&mut extra, 0); // layer mask
-        be32(&mut extra, 0); // blending ranges
-        let ascii: Vec<u8> = layer.name.bytes().filter(|b| b.is_ascii()).take(255).collect();
-        let mut pascal = vec![ascii.len() as u8];
-        pascal.extend(ascii);
-        while pascal.len() % 4 != 0 {
-            pascal.push(0);
-        }
-        extra.extend(pascal);
-        // Unicode layer name (Japanese names).
-        let utf16: Vec<u16> = layer.name.encode_utf16().collect();
-        let mut luni = Vec::new();
-        be32(&mut luni, utf16.len() as u32);
-        for u in utf16 {
-            be16(&mut luni, u);
-        }
-        while luni.len() % 4 != 0 {
-            luni.push(0);
-        }
-        extra.extend_from_slice(b"8BIMluni");
-        be32(&mut extra, luni.len() as u32);
-        extra.extend(luni);
-        be32(&mut records, extra.len() as u32);
-        records.extend(extra);
-        for (_, data) in chans {
-            channel_data.extend(data);
-        }
-    }
-    let mut layer_info = Vec::new();
-    be16(&mut layer_info, layers.len() as u16);
-    layer_info.extend(records);
-    layer_info.extend(channel_data);
-    if layer_info.len() % 2 != 0 {
-        layer_info.push(0);
-    }
-    let mut lm = Vec::new();
-    be32(&mut lm, layer_info.len() as u32);
-    lm.extend(layer_info);
-    be32(&mut lm, 0); // global layer mask
-    be32(&mut f, lm.len() as u32);
-    f.extend(lm);
-
-    // Merged image: RLE, all row byte counts first, then the rows of R, G, B.
-    be16(&mut f, 1);
-    let flat = resample::over_white(merged);
-    let planes: Vec<Vec<u8>> = (0..3).map(|c| flat.iter().skip(c).step_by(3).copied().collect()).collect();
-    let mut counts = Vec::new();
-    let mut rows = Vec::new();
-    for plane in &planes {
-        for y in 0..h {
-            let packed = packbits(&plane[y * w..(y + 1) * w]);
-            be16(&mut counts, packed.len() as u16);
-            rows.extend(packed);
-        }
-    }
-    f.extend(counts);
-    f.extend(rows);
-    write_atomic(path, &f)
-}
-
 /// Canvas-sized RGBA from any image (resized with Lanczos when needed).
 pub fn to_canvas_rgba(px: &Pixels, w: usize, h: usize) -> Vec<u8> {
     let rgba = px.rgba();
     resample::resize_rgba(&rgba, px.w, px.h, w, h, Filter::Lanczos)
-}
-
-fn rle_plane(plane: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut counts = Vec::new();
-    let mut rows = Vec::new();
-    for y in 0..h {
-        let packed = packbits(&plane[y * w..(y + 1) * w]);
-        be16(&mut counts, packed.len() as u16);
-        rows.extend(packed);
-    }
-    counts.extend(rows);
-    counts
-}
-
-/// PackBits run-length encoding of one row.
-fn packbits(row: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < row.len() {
-        let mut run = 1;
-        while i + run < row.len() && run < 128 && row[i + run] == row[i] {
-            run += 1;
-        }
-        if run >= 2 {
-            out.push((1i16 - run as i16) as u8);
-            out.push(row[i]);
-            i += run;
-            continue;
-        }
-        let start = i;
-        let mut len = 0;
-        while i < row.len() && len < 128 {
-            if i + 1 < row.len() && row[i] == row[i + 1] {
-                break;
-            }
-            i += 1;
-            len += 1;
-        }
-        out.push((len - 1) as u8);
-        out.extend_from_slice(&row[start..start + len]);
-    }
-    out
-}
-
-fn be16(v: &mut Vec<u8>, x: u16) {
-    v.extend_from_slice(&x.to_be_bytes());
-}
-
-fn be32(v: &mut Vec<u8>, x: u32) {
-    v.extend_from_slice(&x.to_be_bytes());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::packbits;
-
-    fn unpack(data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < data.len() {
-            let n = data[i] as i8;
-            i += 1;
-            if n >= 0 {
-                out.extend_from_slice(&data[i..i + n as usize + 1]);
-                i += n as usize + 1;
-            } else {
-                out.extend(std::iter::repeat_n(data[i], (1 - n as i16) as usize));
-                i += 1;
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn packbits_roundtrip() {
-        let rows: Vec<Vec<u8>> = vec![
-            vec![],
-            vec![7],
-            vec![1, 2, 3, 3, 3, 3, 4, 5, 5],
-            vec![9; 300],
-            (0..1000).map(|i| (i * 7 % 13) as u8).collect(),
-            (0..1000).map(|i| (i / 3) as u8).collect(),
-        ];
-        for r in rows {
-            assert_eq!(unpack(&packbits(&r)), r);
-        }
-    }
 }

@@ -1,5 +1,5 @@
 //! Writes every export format through the app's export job from the regression fixtures, for checking with other
-//! readers (Pillow, Photoshop).
+//! readers (Pillow).
 //!
 //!     cargo run --release --example export_check -- <out_dir>
 
@@ -15,7 +15,7 @@ fn main() {
     let shaded = Image8::from_dynamic(&image::open(fx.join("shaded.png")).unwrap());
     let l = shading::shadow_layers(&original, &shaded, None, &Options { color: true, ..Options::default() });
     let ai_full = export::to_canvas_rgba(&Pixels { w: shaded.w, h: shaded.h, channels: 4, data: &shaded.rgba }, l.w, l.h);
-    for format in [Format::Png, Format::Jpeg, Format::Webp, Format::Psd] {
+    for format in [Format::Png, Format::Jpeg, Format::Webp] {
         let job = Job {
             original: &original,
             shaded: &shaded,
@@ -26,7 +26,6 @@ fn main() {
             encoding: Encoding { format, png_level: 6, quality: 92 },
             dir: &out,
             stem: "check",
-            names: ["影", "AI の出力", "元画像"],
         };
         let outcome = export::run_job(&job);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
