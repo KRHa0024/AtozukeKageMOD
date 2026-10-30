@@ -7,7 +7,7 @@ use eframe::egui;
 use kage::blend::{AI, SHADOW};
 use kage::shading::Image8;
 
-use super::{App, Phase, Screen};
+use super::{App, Phase, Screen, MODELS_TAB};
 use crate::i18n::Lang;
 
 pub(super) struct Shot {
@@ -64,11 +64,11 @@ impl App {
             "history" => self.right_tab = 1,
             "export" => self.export_open = true,
             "quit" => self.quit_open = true,
-            "settings_models" => self.screen = Screen::Settings,
-            "settings_comfy" => {
+            "settings_models" => {
                 self.screen = Screen::Settings;
-                self.settings_tab = 1;
+                self.settings_tab = MODELS_TAB;
             }
+            "settings_comfy" => self.screen = Screen::Settings,
             "settings_log" => {
                 self.screen = Screen::Settings;
                 self.settings_tab = 2;
@@ -107,6 +107,9 @@ impl App {
                         export = true;
                     } else {
                         shot.done_frame = Some(shot.frame);
+                        if let Some(light) = std::env::var("KAGE_LIGHT").ok().and_then(|v| v.parse().ok()) {
+                            self.cfg.light_dir = light;
+                        }
                         if let Some((layer, blend)) = shot.solo {
                             self.visible = std::array::from_fn(|i| i == layer);
                             self.selected_layer = layer;

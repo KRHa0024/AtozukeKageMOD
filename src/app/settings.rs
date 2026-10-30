@@ -8,11 +8,14 @@ use kage::comfy;
 use kage::log::Level;
 use kage::models::{self, Status, MODELS};
 
-use super::{App, Screen};
+use super::{App, Screen, COMFY_TAB, MODELS_TAB};
 use crate::i18n::T;
-use crate::theme::{AMBER, BLUE, GREEN, LINE, MUTED, RED, SEL, SIZE_ICON, SIZE_TITLE, TEXT};
+use crate::theme::{AMBER, BLUE, GREEN, LINE, MUTED, RED, SIZE_ICON, SIZE_TITLE, TEXT};
 
 const COMFY_RELEASES: &str = "https://github.com/comfyanonymous/ComfyUI/releases";
+/// Order of the tabs in the list: set up ComfyUI first, as the README says.
+const NAV_ORDER: [usize; 3] = [COMFY_TAB, MODELS_TAB, 2];
+const NAV_DOT_RADIUS: f32 = 4.0;
 /// Long explanations stay readable on wide windows.
 const TEXT_WIDTH: f32 = 640.0;
 const CONTENT_MIN_WIDTH: f32 = 720.0;
@@ -34,15 +37,33 @@ impl App {
                 self.screen = Screen::Main;
             }
             ui.label(RichText::new(t.settings).strong());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.language_combo(ui));
         });
+    }
+
+    /// State of a settings tab for its dot in the list; the log has none.
+    fn tab_state(&self, tab: usize) -> Option<egui::Color32> {
+        match tab {
+            COMFY_TAB => Some(match self.comfy.state() {
+                comfy::State::Ready { .. } => GREEN,
+                comfy::State::Starting => BLUE,
+                comfy::State::MissingNodes(_) | comfy::State::Failed(_) => RED,
+                _ => AMBER,
+            }),
+            MODELS_TAB if self.verifier.running() => Some(BLUE),
+            MODELS_TAB => Some(if self.verifier.all_ok() { GREEN } else { AMBER }),
+            _ => None,
+        }
     }
 
     pub(super) fn settings_nav(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
-        for (i, name) in t.tabs.iter().enumerate() {
-            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new(*name).selected(self.settings_tab == i)).clicked() {
-                self.settings_tab = i;
+        for tab in NAV_ORDER {
+            let resp = ui.add_sized([ui.available_width(), 30.0], egui::Button::new(t.tabs[tab]).selected(self.settings_tab == tab));
+            if let Some(color) = self.tab_state(tab) {
+                ui.painter().circle_filled(egui::pos2(resp.rect.right() - 14.0, resp.rect.center().y), NAV_DOT_RADIUS, color);
+            }
+            if resp.clicked() {
+                self.settings_tab = tab;
             }
         }
     }
@@ -52,13 +73,13 @@ impl App {
         // Text wraps at the window width, down to a width the tables need; narrower windows scroll.
         let width = ui.available_width().max(CONTENT_MIN_WIDTH);
         match self.settings_tab {
-            0 => {
+            MODELS_TAB => {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_max_width(width);
                     self.models_tab(ui, t)
                 });
             }
-            1 => {
+            COMFY_TAB => {
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_max_width(width);
                     self.comfy_tab(ui, t)
@@ -81,7 +102,7 @@ impl App {
             ui.label(RichText::new(format!("{ok}/{} {}", MODELS.len(), t.match_word)).color(if ok == MODELS.len() { GREEN } else { AMBER }));
             ui.label(RichText::new(t.total.replace("{}", &format!("{:.1}", models::total_bytes() as f64 / 1e9))).color(MUTED));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let b = egui::Button::new(RichText::new(format!("{}  {}", ph::ARROWS_CLOCKWISE, t.recheck)).color(BLUE)).fill(SEL).stroke(Stroke::new(1.0, BLUE));
+                let b = egui::Button::new(format!("{}  {}", ph::ARROWS_CLOCKWISE, t.recheck));
                 if ui.add_enabled(!checking, b).on_hover_text(t.recheck_tip).clicked() {
                     self.verifier.start(PathBuf::from(self.cfg.model_dir.trim()));
                     // A file that just became valid must be picked up by ComfyUI's model list.
@@ -228,6 +249,16 @@ impl App {
                 ui.end_row();
             }
         });
+        if let Some(dir) = self.comfy_models_to_use() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(t.models_found);
+                if ui.button(t.use_models).on_hover_text(dir.display().to_string()).clicked() {
+                    self.cfg.model_dir = dir.display().to_string();
+                    self.apply_dirs();
+                }
+            });
+        }
         ui.add_space(8.0);
         ui.separator();
         ui.label(RichText::new(t.gpu_memory).strong());
@@ -237,6 +268,20 @@ impl App {
             ui.set_max_width(TEXT_WIDTH);
             ui.add(egui::Label::new(RichText::new(t.keep_loaded_desc).color(MUTED)).wrap());
         });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(RichText::new(t.display_section).strong());
+        ui.horizontal(|ui| {
+            ui.label(t.display_language);
+            self.language_combo(ui);
+        });
+    }
+
+    /// The chosen ComfyUI's own models directory, when it holds all the files and is not in use yet.
+    fn comfy_models_to_use(&self) -> Option<PathBuf> {
+        let install = comfy::detect(Path::new(self.cfg.comfy_dir.trim()))?;
+        let dir = install.main_py.parent()?.join("models");
+        (dir != Path::new(self.cfg.model_dir.trim()) && models::all_present(&dir)).then_some(dir)
     }
 
     fn log_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {

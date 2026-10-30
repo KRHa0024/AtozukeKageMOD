@@ -101,6 +101,11 @@ pub fn model_path(dir: &Path, m: &ModelFile) -> PathBuf {
     dir.join(m.folder).join(m.file)
 }
 
+/// All files are in `dir` with the right size (a quick look; the Verifier still checks the hashes).
+pub fn all_present(dir: &Path) -> bool {
+    MODELS.iter().all(|m| stat(&model_path(dir, m)).is_some_and(|(size, _)| size == m.size))
+}
+
 /// A free name next to `dest` for a file that is being replaced.
 fn aside_path(dest: &Path) -> PathBuf {
     let mut path = dest.with_extension("safetensors.mismatch");

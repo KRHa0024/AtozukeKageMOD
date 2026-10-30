@@ -5,8 +5,8 @@ use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margi
 use egui_phosphor::regular as ph;
 
 use super::settings::open_in_explorer;
-use super::App;
-use crate::theme::{checkerboard, dashed_rect, radius, BLUE, GREEN, LINE_DARK, MUTED, PANEL, RED, SIZE_ICON, SIZE_SMALL, SIZE_TITLE, TEXT};
+use super::{App, Screen};
+use crate::theme::{checkerboard, radius, BLUE, GREEN, LINE_DARK, MUTED, PANEL, RED, SIZE_BODY, SIZE_ICON, SIZE_SMALL, TEXT};
 
 /// Step of the zoom buttons and keys.
 pub(super) const ZOOM_STEP: f32 = 1.25;
@@ -62,10 +62,15 @@ impl App {
         let on_canvas = |c: Color32| if self.cfg.canvas_shade == 0 { c } else { Color32::WHITE };
 
         let Some(img) = self.image.clone() else {
-            let inner = rect.shrink(24.0);
-            dashed_rect(&painter, inner);
-            painter.text(inner.center() - Vec2::new(0.0, 14.0), Align2::CENTER_CENTER, ph::UPLOAD_SIMPLE, FontId::proportional(40.0), on_canvas(MUTED));
-            painter.text(inner.center() + Vec2::new(0.0, 24.0), Align2::CENTER_CENTER, t.drop_here, FontId::proportional(SIZE_TITLE), on_canvas(MUTED));
+            // Empty and plain, unless something still has to be set up.
+            if let Some(tab) = self.setup_tab() {
+                painter.text(rect.center() - Vec2::new(0.0, 20.0), Align2::CENTER_CENTER, t.setup_needed, FontId::proportional(SIZE_BODY), on_canvas(TEXT));
+                let button = Rect::from_center_size(rect.center() + Vec2::new(0.0, 14.0), Vec2::new(120.0, 28.0));
+                if ui.put(button, egui::Button::new(t.open_settings)).clicked() {
+                    self.screen = Screen::Settings;
+                    self.settings_tab = tab;
+                }
+            }
             self.drop_outline(&ctx, &painter, rect);
             return;
         };
@@ -146,7 +151,7 @@ impl App {
             }
         }
         self.drop_outline(&ctx, &painter, rect);
-        self.canvas_overlays(&ctx, rect, scale * ppp, has_result);
+        self.toast_overlay(&ctx, rect);
     }
 
     /// A file is being dragged over the window.
@@ -156,42 +161,10 @@ impl App {
         }
     }
 
-    /// `device_scale`: device pixels per image pixel.
-    fn canvas_overlays(&mut self, ctx: &egui::Context, rect: Rect, device_scale: f32, has_result: bool) {
+    /// Messages at the top of the canvas. Failures stay until closed.
+    fn toast_overlay(&mut self, ctx: &egui::Context, rect: Rect) {
         let t = self.t();
         let overlay = Frame::new().fill(PANEL).stroke(Stroke::new(1.0, LINE_DARK)).corner_radius(radius()).inner_margin(Margin::symmetric(6, 4));
-
-        // View tools (bottom right): compare, zoom.
-        egui::Area::new(Id::new("zoom"))
-            .fixed_pos(rect.right_bottom() + Vec2::new(-8.0, -8.0))
-            .pivot(Align2::RIGHT_BOTTOM)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                overlay.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let compare = egui::Button::new(format!("{}  {}", ph::SQUARE_SPLIT_HORIZONTAL, t.compare)).selected(has_result && self.compare_on);
-                        if ui.add_enabled(has_result, compare).on_hover_text(t.compare_tip).clicked() {
-                            self.compare_on = !self.compare_on;
-                        }
-                        ui.separator();
-                        if ui.button("−").on_hover_text(t.zoom_out).clicked() {
-                            self.zoom_by(1.0 / ZOOM_STEP);
-                        }
-                        ui.label(RichText::new(format!("{:>4.0}%", device_scale * 100.0)).monospace());
-                        if ui.button("+").on_hover_text(t.zoom_in).clicked() {
-                            self.zoom_by(ZOOM_STEP);
-                        }
-                        if ui.button(t.fit).on_hover_text(t.fit_tip).clicked() {
-                            self.zoom_fit();
-                        }
-                        if ui.button("1:1").on_hover_text(t.actual_tip).clicked() {
-                            self.zoom_actual(ctx);
-                        }
-                    });
-                });
-            });
-
-        // Export result (top center). Failures stay until closed.
         let mut close = false;
         if let Some(toast) = &self.toast {
             let mut open_dir = None;

@@ -30,6 +30,10 @@ use crate::theme::{self, BG, CANVAS_SHADES, LINE, PANEL};
 use shot::Shot;
 use views::Views;
 
+/// Indexes of the settings tabs (`T::tabs`).
+const MODELS_TAB: usize = 0;
+const COMFY_TAB: usize = 1;
+
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
     Main,
@@ -95,7 +99,6 @@ pub struct App {
     comfy: Comfy,
 
     image: Option<Input>,
-    load_error: Option<String>,
     seed: String,
 
     phase: Phase,
@@ -172,7 +175,7 @@ impl App {
         Self {
             lang,
             screen: Screen::Main,
-            settings_tab: 0,
+            settings_tab: COMFY_TAB,
             applied_dirs: (cfg.model_dir.clone(), cfg.comfy_dir.clone()),
             dirs_pending: false,
             post_seen: (cfg.strength, cfg.gray, cfg.ghost, cfg.bg_shadow),
@@ -184,7 +187,6 @@ impl App {
             verifier,
             comfy,
             image: None,
-            load_error: None,
             seed: "random".into(),
             phase: Phase::Idle,
             stage: 0,

@@ -54,7 +54,6 @@ impl App {
                 }
                 self.image = Some(Input { img: Arc::new(img), tex, name });
                 self.input_filter = None;
-                self.load_error = None;
                 self.zoom = None;
                 self.pan = Vec2::ZERO;
                 self.current = None;
@@ -64,7 +63,7 @@ impl App {
             }
             Err(e) => {
                 self.log.error(format!("Could not open {}: {e}", path.display()));
-                self.load_error = Some(e);
+                self.warn(ctx, &e);
             }
         }
     }
@@ -93,7 +92,7 @@ impl App {
                 }
                 self.start_run(ctx, Some(Arc::new(img)));
             }
-            Err(e) => self.load_error = Some(e),
+            Err(e) => self.warn(ctx, &e),
         }
     }
 

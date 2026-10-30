@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, Shadow, Stroke, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Shadow, Stroke, Vec2};
 
 pub const BLUE: Color32 = Color32::from_rgb(0x00, 0x53, 0x7d);
 pub const SEL: Color32 = Color32::from_rgb(0xbf, 0xe3, 0xff);
@@ -23,8 +23,6 @@ pub const CONTROL_EDGE: Color32 = Color32::from_gray(0x8a);
 pub const HOVER: Color32 = Color32::from_gray(0xe6);
 /// Fill of a small icon button inside a row.
 pub const SLOT: Color32 = Color32::from_gray(0xf8);
-/// Drop-zone outline.
-pub const DASH: Color32 = Color32::from_gray(0x8a);
 /// Canvas surround: light, mid gray, dark.
 pub const CANVAS_SHADES: [Color32; 3] = [Color32::from_gray(0xe3), Color32::from_gray(0x80), Color32::from_gray(0x3a)];
 
@@ -39,11 +37,13 @@ pub fn radius() -> CornerRadius {
     CornerRadius::same(RADIUS)
 }
 
-pub fn dashed_rect(painter: &egui::Painter, r: Rect) {
-    let stroke = Stroke::new(1.0, DASH);
-    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
-    for w in pts.windows(2) {
-        painter.extend(egui::Shape::dashed_line(&[w[0], w[1]], stroke, 5.0, 4.0));
+/// The main action of a screen: a solid fill, unlike selection (SEL). Disabled it is a plain button.
+pub fn primary_button(text: impl Into<String>, size: f32, enabled: bool) -> egui::Button<'static> {
+    let text = RichText::new(text.into()).size(size);
+    if enabled {
+        egui::Button::new(text.strong().color(Color32::WHITE)).fill(BLUE).stroke(Stroke::new(1.0, BLUE))
+    } else {
+        egui::Button::new(text)
     }
 }
 

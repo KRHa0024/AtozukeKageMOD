@@ -2,12 +2,12 @@
 
 use std::path::Path;
 
-use eframe::egui::{self, Align, Id, Layout, RichText, Stroke, Vec2};
+use eframe::egui::{self, Align, Id, Layout, RichText, Vec2};
 use kage::blend::{AI, ORIGINAL, SHADOW};
 use kage::export::{self, Format, FORMATS};
 
 use super::App;
-use crate::theme::{AMBER, BLUE, MUTED, SEL, SIZE_TITLE};
+use crate::theme::{primary_button, AMBER, MUTED, SIZE_BODY, SIZE_TITLE};
 
 const DIALOG_WIDTH: f32 = 420.0;
 
@@ -100,8 +100,7 @@ impl App {
             ui.separator();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let can_export = psd || self.cfg.export_targets.iter().any(|&x| x);
-                let b = egui::Button::new(RichText::new(t.do_export).strong().color(BLUE)).fill(SEL).stroke(Stroke::new(1.0, BLUE));
-                if ui.add_enabled(can_export, b).on_disabled_hover_text(t.nothing_to_export).clicked() {
+                if ui.add_enabled(can_export, primary_button(t.do_export, SIZE_BODY, can_export)).on_disabled_hover_text(t.nothing_to_export).clicked() {
                     go = true;
                     self.export_open = false;
                 }
