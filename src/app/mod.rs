@@ -16,7 +16,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use eframe::egui::{self, Frame, Margin, Stroke, TextureHandle, Vec2};
-use kage::blend::{View, MODES, SHADOW};
+use kage::blend::{View, DEFAULT_OPACITY, MODES, SHADOW};
 use kage::comfy::{Comfy, Failure};
 use kage::config::{self, Config};
 use kage::export::Outcome;
@@ -225,7 +225,7 @@ impl App {
             post_changed_at: 0.0,
             visible: [true, false, true],
             selected_layer: SHADOW,
-            opacity: [1.0; 3],
+            opacity: DEFAULT_OPACITY,
             solo: None,
             compare_on: false,
             compare: 0.5,

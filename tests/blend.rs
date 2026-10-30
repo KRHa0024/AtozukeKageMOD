@@ -3,9 +3,14 @@
 
 use std::path::PathBuf;
 
-use kage::blend::{composite, flatten, flatten_view, shadow_rgba, Mode, Stack, View, AI, MODES, ORIGINAL, SHADOW};
+use kage::blend::{composite, flatten, flatten_view, shadow_rgba, Mode, Stack, View, AI, DEFAULT_MODE, MODES, ORIGINAL, SHADOW};
 use kage::export::{self, Pixels};
 use kage::shading::{self, Image8, Layers, Options, Stats};
+
+#[test]
+fn the_default_mode_is_linear_burn() {
+    assert_eq!(MODES[DEFAULT_MODE], Mode::LinearBurn);
+}
 
 fn fixture(name: &str) -> image::DynamicImage {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);

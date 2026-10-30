@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Align2, Color32, FontId, Frame, Id, Margin, Pos2, Rect, Sense, Stroke, StrokeKind, TextureId, Vec2};
 use egui_phosphor::regular as ph;
-use kage::blend::{AI, MENU_ORDER, ORIGINAL, SHADOW};
+use kage::blend::{AI, DEFAULT_OPACITY, MENU_ORDER, ORIGINAL, SHADOW};
 
 use super::App;
 use crate::i18n::Lang;
@@ -101,7 +101,7 @@ impl App {
             ui.end_row();
             let label = ui.add(egui::Label::new(t.opacity).sense(Sense::click()));
             if label.on_hover_text(t.reset_tip).double_clicked() && has_result && sel != ORIGINAL {
-                self.opacity[sel] = 1.0;
+                self.opacity[sel] = DEFAULT_OPACITY[sel];
             }
             ui.add_enabled_ui(has_result && sel != ORIGINAL, |ui| {
                 ui.horizontal(|ui| {
@@ -169,18 +169,18 @@ impl App {
             } else if let Some(img) = &self.image {
                 fit_thumb(ui.painter(), img.tex.id(), Vec2::new(img.img.w as f32, img.img.h as f32), slot, tint);
             }
-            // Name and blend / opacity.
+            // Name and opacity, then the blend mode, which stops short of the button at the end of the row.
             let x = slot.right() + 10.0;
             let painter = ui.painter_at(r.shrink(2.0));
-            painter.text(Pos2::new(x, r.top() + 20.0), Align2::LEFT_CENTER, t.layer_names[id], FontId::proportional(SIZE_BODY), if visible { TEXT } else { MUTED });
-            let sub = match id {
-                ORIGINAL => t.background.to_string(),
-                _ => {
-                    let mode = if id == SHADOW { t.blends[self.cfg.blend] } else { t.normal };
-                    format!("{mode} · {:.0}%", self.opacity[id] * 100.0)
-                }
+            let (name, sub) = match id {
+                ORIGINAL => (t.layer_names[id].to_string(), t.background),
+                _ => (format!("{} · {:.0}%", t.layer_names[id], self.opacity[id] * 100.0), if id == SHADOW { t.blends[self.cfg.blend] } else { t.normal }),
             };
-            painter.text(Pos2::new(x, r.top() + 40.0), Align2::LEFT_CENTER, sub, FontId::proportional(SIZE_SMALL), MUTED);
+            painter.text(Pos2::new(x, r.top() + 20.0), Align2::LEFT_CENTER, name, FontId::proportional(SIZE_BODY), if visible { TEXT } else { MUTED });
+            let mut job = egui::text::LayoutJob::simple_singleline(sub.to_string(), FontId::proportional(SIZE_SMALL), MUTED);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(r.right() - GAP * 2.0 - CONTROL_HEIGHT - x);
+            let galley = painter.layout_job(job);
+            painter.galley(Pos2::new(x, r.top() + 40.0 - galley.size().y / 2.0), galley, MUTED);
             if id == ORIGINAL {
                 let lock = Pos2::new(r.right() - GAP - CONTROL_HEIGHT / 2.0, r.center().y);
                 painter.text(lock, Align2::CENTER_CENTER, ph::LOCK_SIMPLE, FontId::proportional(14.0), MUTED);

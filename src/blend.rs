@@ -44,6 +44,10 @@ pub const MODES: [Mode; 8] = [
 ];
 /// Order in the blend-mode menu (Normal first, as in image editors).
 pub const MENU_ORDER: [usize; 8] = [7, 0, 1, 2, 3, 4, 5, 6];
+/// Index in `MODES` of the mode the shadow layer starts with: Linear Burn.
+pub const DEFAULT_MODE: usize = 2;
+/// What each layer starts with and goes back to on a reset.
+pub const DEFAULT_OPACITY: [f32; 3] = [0.5, 1.0, 1.0];
 
 impl Mode {
     /// Blend of base `b` and layer `l` (0..1).

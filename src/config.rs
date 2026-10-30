@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::blend::DEFAULT_MODE;
 use crate::export::FORMATS;
 use crate::models::MODELS;
 
@@ -31,6 +32,8 @@ pub struct Config {
     pub png_level: u8,
     pub quality: u8,
     pub out_dir: String,
+    /// Saved as `blend` while Multiply was the default; the new key moves those settings to the current default.
+    #[serde(rename = "shadow_blend")]
     pub blend: usize,
     /// Canvas surround: 0 light, 1 mid gray, 2 dark.
     pub canvas_shade: usize,
@@ -56,7 +59,7 @@ impl Default for Config {
             png_level: 6,
             quality: 92,
             out_dir: default_out_dir().display().to_string(),
-            blend: 0,
+            blend: DEFAULT_MODE,
             canvas_shade: 0,
             window: None,
         }
@@ -148,4 +151,22 @@ fn default_out_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .map(|h| PathBuf::from(h).join("Pictures").join("AtozukeKageMOD"))
         .unwrap_or_else(|| exe_dir().join("output"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_saved_under_the_old_blend_key_start_from_the_default() {
+        let cfg: Config = serde_json::from_str(r#"{"blend": 0}"#).unwrap();
+        assert_eq!(cfg.blend, DEFAULT_MODE);
+    }
+
+    #[test]
+    fn a_chosen_blend_mode_is_kept_across_a_save() {
+        let text = serde_json::to_string(&Config { blend: 4, ..Config::default() }).unwrap();
+        let cfg: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(cfg.blend, 4);
+    }
 }
