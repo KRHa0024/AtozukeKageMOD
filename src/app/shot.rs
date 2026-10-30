@@ -50,6 +50,9 @@ impl App {
         if std::env::var("KAGE_LANG").as_deref() == Ok("en") {
             self.lang = Lang::En;
         }
+        if let Ok(seed) = std::env::var("KAGE_SEED") {
+            self.seed = seed;
+        }
         let scene = std::env::var("KAGE_SCENE").unwrap_or_default();
         if scene != "empty" {
             if let Ok(path) = std::env::var("KAGE_IMAGE") {
