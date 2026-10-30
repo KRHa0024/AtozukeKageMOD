@@ -1,0 +1,6 @@
+このディレクトリに次のファイルを入れてください。
+Put this file in this directory.
+
+birefnet.safetensors
+0.44 GB
+https://huggingface.co/Comfy-Org/BiRefNet/blob/main/background_removal/birefnet.safetensors

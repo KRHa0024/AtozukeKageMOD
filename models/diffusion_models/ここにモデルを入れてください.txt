@@ -1,0 +1,6 @@
+このディレクトリに次のファイルを入れてください。
+Put this file in this directory.
+
+qwen_image_2.1_int8_convrot.safetensors
+7.26 GB
+https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors

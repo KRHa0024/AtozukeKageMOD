@@ -109,12 +109,14 @@ fn opaque_source_is_byte_identical_to_legacy_flatten() {
                 for ai_opacity in [0.5f32, 1.0] {
                     for bits in 0..8u8 {
                         let visible = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
-                        let view = View { visible, opacity: [shadow_opacity, ai_opacity, 1.0], mode };
+                        let view = View { visible, opacity: [shadow_opacity, ai_opacity, 1.0], mode, shadow_offset: (0, 0) };
                         let stack = Stack {
                             original: visible[ORIGINAL].then_some(rgba.as_slice()),
                             silhouette: &rgba,
                             ai: visible[AI].then_some((ai.as_slice(), ai_opacity)),
                             shadow: visible[SHADOW].then_some((layers.multiply.as_slice(), ch, mode, shadow_opacity)),
+                            shadow_offset: (0, 0),
+                            width: w,
                         };
                         let expect = legacy_flatten(&stack, n);
                         let ours = flatten(&stack, n);
@@ -164,7 +166,7 @@ fn original_alpha_is_kept_for_every_mode() {
         for mode in MODES {
             for ai_visible in [false, true] {
                 for shadow_opacity in [0.3f32, 1.0] {
-                    let view = View { visible: [true, ai_visible, true], opacity: [shadow_opacity, 0.7, 1.0], mode };
+                    let view = View { visible: [true, ai_visible, true], opacity: [shadow_opacity, 0.7, 1.0], mode, shadow_offset: (0, 0) };
                     let out = flatten_view(&f.original, &f.ai_full, &f.layers, &view);
                     let got: Vec<u8> = out.chunks_exact(4).map(|p| p[3]).collect();
                     // With the AI layer visible its own alpha (opaque here) is allowed to cover; only the plain
@@ -188,7 +190,7 @@ fn shadow_alone_stays_inside_the_silhouette() {
         let f = fixture_with(color);
         let alpha: Vec<u8> = f.original.rgba.chunks_exact(4).map(|p| p[3]).collect();
         for mode in MODES {
-            let view = View { visible: [true, false, false], opacity: [1.0, 1.0, 1.0], mode };
+            let view = View { visible: [true, false, false], opacity: [1.0, 1.0, 1.0], mode, shadow_offset: (0, 0) };
             let out = flatten_view(&f.original, &f.ai_full, &f.layers, &view);
             let mut any = false;
             for (i, (p, &a)) in out.chunks_exact(4).zip(&alpha).enumerate() {
@@ -207,7 +209,7 @@ fn shadow_alone_stays_inside_the_silhouette() {
 fn shadow_alone_over_opaque_pixels_shows_itself() {
     // Where the source is fully opaque the shadow alone has the layer's coverage (opacity 1 for blend modes).
     let f = fixture_with(true);
-    let view = View { visible: [true, false, false], opacity: [1.0, 1.0, 1.0], mode: Mode::Multiply };
+    let view = View { visible: [true, false, false], opacity: [1.0, 1.0, 1.0], mode: Mode::Multiply, shadow_offset: (0, 0) };
     let out = flatten_view(&f.original, &f.ai_full, &f.layers, &view);
     for (i, p) in out.chunks_exact(4).enumerate() {
         if f.original.rgba[i * 4 + 3] == 255 {
@@ -224,7 +226,7 @@ fn scale_alpha(alpha: u8, by: u8) -> u8 {
 fn shadow_rgba_multiply_keeps_layer_colour_with_source_alpha() {
     for color in [false, true] {
         let f = fixture_with(color);
-        let out = shadow_rgba(&f.layers, Mode::Multiply, &f.original.rgba);
+        let out = shadow_rgba(&f.layers, Mode::Multiply, &f.original.rgba, (0, 0));
         assert_eq!(out.len(), f.layers.w * f.layers.h * 4);
         for (i, p) in out.chunks_exact(4).enumerate() {
             let a = f.original.rgba[i * 4 + 3];
@@ -242,7 +244,7 @@ fn shadow_rgba_multiply_keeps_layer_colour_with_source_alpha() {
 fn shadow_rgba_normal_is_black_with_scaled_alpha() {
     for color in [false, true] {
         let f = fixture_with(color);
-        let out = shadow_rgba(&f.layers, Mode::Normal, &f.original.rgba);
+        let out = shadow_rgba(&f.layers, Mode::Normal, &f.original.rgba, (0, 0));
         assert_eq!(out.len(), f.layers.w * f.layers.h * 4);
         for (i, p) in out.chunks_exact(4).enumerate() {
             let expect = scale_alpha(f.layers.overlay[i * 4 + 3], f.original.rgba[i * 4 + 3]);
@@ -253,7 +255,70 @@ fn shadow_rgba_normal_is_black_with_scaled_alpha() {
 
         // An opaque source gives the overlay itself.
         let opaque: Vec<u8> = f.original.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
-        let out = shadow_rgba(&f.layers, Mode::Normal, &opaque);
+        let out = shadow_rgba(&f.layers, Mode::Normal, &opaque, (0, 0));
         assert!(out == f.layers.overlay, "color={color}: opaque source must equal layers.overlay");
     }
+}
+
+/// One dark layer pixel at (2, 1) over a flat opaque image.
+fn dot(w: usize, h: usize) -> (Image8, Layers) {
+    let rgba: Vec<u8> = (0..w * h).flat_map(|_| [200, 150, 100, 255]).collect();
+    let mut layers = synthetic_layers(w, h, false, 1);
+    layers.multiply = vec![255; w * h];
+    layers.multiply[w + 2] = 0;
+    layers.overlay = layers.multiply.iter().flat_map(|&v| [0, 0, 0, 255 - v]).collect();
+    (Image8 { w, h, has_alpha: false, rgba, icc: None, deep: false }, layers)
+}
+
+#[test]
+fn moved_shadow_lands_at_the_offset() {
+    let (w, h) = (8, 6);
+    let (original, layers) = dot(w, h);
+    let view = View { visible: [true, false, true], opacity: [1.0; 3], mode: Mode::Multiply, shadow_offset: (3, 2) };
+    let out = flatten_view(&original, &[], &layers, &view);
+    for y in 0..h {
+        for x in 0..w {
+            let px = &out[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            let expect: [u8; 4] = if (x, y) == (5, 3) { [0, 0, 0, 255] } else { [200, 150, 100, 255] };
+            assert_eq!(px, expect, "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn what_a_moved_shadow_uncovers_is_left_alone_in_every_mode() {
+    // White is not neutral in Overlay and the like, so the uncovered part must skip the blend altogether.
+    let (w, h) = (8, 6);
+    let (original, layers) = dot(w, h);
+    for mode in MODES {
+        let view = View { visible: [true, false, true], opacity: [1.0; 3], mode, shadow_offset: (2, 1) };
+        let out = flatten_view(&original, &[], &layers, &view);
+        for y in 0..h {
+            for x in 0..w {
+                if x < 2 || y < 1 {
+                    assert_eq!(&out[(y * w + x) * 4..(y * w + x) * 4 + 4], [200, 150, 100, 255], "{mode:?} ({x}, {y})");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_shadow_moved_off_the_image_leaves_it_unchanged() {
+    let (w, h) = (8, 6);
+    let (original, layers) = dot(w, h);
+    let view = View { visible: [true, false, true], opacity: [1.0; 3], mode: Mode::Overlay, shadow_offset: (w as i32, 0) };
+    assert!(flatten_view(&original, &[], &layers, &view) == original.rgba);
+}
+
+#[test]
+fn shadow_layer_file_moves_too() {
+    let (w, h) = (8, 6);
+    let (original, layers) = dot(w, h);
+    let out = shadow_rgba(&layers, Mode::Multiply, &original.rgba, (-1, 1));
+    assert_eq!(&out[(2 * w + 1) * 4..(2 * w + 1) * 4 + 4], [0, 0, 0, 255], "the dot moved from (2, 1) to (1, 2)");
+    assert_eq!(out[(w + 2) * 4 + 3], 255);
+    assert_eq!(out[3], 0, "the top row is uncovered");
+    assert_eq!(out[(2 * w - 2) * 4 + 3], 255, "(w - 2, 1) is covered");
+    assert_eq!(out[(2 * w - 1) * 4 + 3], 0, "the right column is uncovered too");
 }

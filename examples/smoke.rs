@@ -64,7 +64,7 @@ fn main() {
                 std::fs::create_dir_all(&out).unwrap();
                 let l = &r.solved.layers;
                 let ct = if l.color { image::ColorType::Rgb8 } else { image::ColorType::L8 };
-                let view = kage::blend::View { visible: [true, false, true], opacity: [1.0; 3], mode: kage::blend::Mode::Multiply };
+                let view = kage::blend::View { visible: [true, false, true], opacity: [1.0; 3], mode: kage::blend::Mode::Multiply, shadow_offset: (0, 0) };
                 let composite = kage::blend::flatten_view(&r.original, &r.ai_full, l, &view);
                 image::save_buffer(out.join("multiply.png"), &l.multiply, l.w as u32, l.h as u32, ct).unwrap();
                 image::save_buffer(out.join("composite.png"), &composite, l.w as u32, l.h as u32, image::ColorType::Rgba8).unwrap();

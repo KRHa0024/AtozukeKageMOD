@@ -258,8 +258,8 @@ fn write_files(job: &Job, written: &mut Vec<PathBuf>) -> Result<(), String> {
     let ext = format.ext();
     if targets[0] {
         let path = unique_path(dir, stem, "shadow", ext);
-        if view.mode == Mode::Normal || !original.alpha_is_opaque() {
-            let rgba = blend::shadow_rgba(layers, view.mode, &original.rgba);
+        if view.mode == Mode::Normal || !original.alpha_is_opaque() || view.shadow_offset != (0, 0) {
+            let rgba = blend::shadow_rgba(layers, view.mode, &original.rgba, view.shadow_offset);
             save(&Pixels { w, h, channels: 4, data: &rgba }, &path, encoding, None)?;
         } else {
             let channels = if layers.color { 3 } else { 1 };

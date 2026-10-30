@@ -1,0 +1,6 @@
+このディレクトリに次のファイルを入れてください。
+Put this file in this directory.
+
+qwen3vl_8b_int8_convrot.safetensors
+9.35 GB
+https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors

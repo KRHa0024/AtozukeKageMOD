@@ -1,0 +1,6 @@
+このディレクトリに次のファイルを入れてください。
+Put this file in this directory.
+
+qwen_image_2.1_vae_bf16.safetensors
+0.68 GB
+https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/vae/qwen_image_2.1_vae_bf16.safetensors

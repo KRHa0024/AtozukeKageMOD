@@ -14,6 +14,8 @@ pub struct View {
     /// The original's stays 1.
     pub opacity: [f32; 3],
     pub mode: Mode,
+    /// Where the shadow layer was moved to, in image pixels.
+    pub shadow_offset: (i32, i32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -143,6 +145,32 @@ pub struct Stack<'a> {
     pub ai: Option<(&'a [u8], f32)>,
     /// Layer pixels (1 or 3 channels), channels, mode, opacity.
     pub shadow: Option<(&'a [u8], usize, Mode, f32)>,
+    /// Where the shadow layer was moved to, in image pixels; what it leaves uncovered shows no shadow at all.
+    pub shadow_offset: (i32, i32),
+    /// Image width (the height follows from the pixel count).
+    pub width: usize,
+}
+
+/// `pixels` (`bytes` per pixel) moved by `offset`; what is uncovered is `fill`.
+fn moved(pixels: &[u8], bytes: usize, w: usize, (dx, dy): (i32, i32), fill: u8) -> Vec<u8> {
+    let h = pixels.len() / bytes / w;
+    let mut out = vec![fill; pixels.len()];
+    let shift = dx.unsigned_abs() as usize;
+    if shift >= w {
+        return out;
+    }
+    let row_bytes = (w - shift) * bytes;
+    for y in 0..h {
+        let target = y as i64 + dy as i64;
+        if target < 0 || target >= h as i64 {
+            continue;
+        }
+        let (from, to) = if dx >= 0 { (0, shift) } else { (shift, 0) };
+        let src = y * w * bytes + from * bytes;
+        let dst = target as usize * w * bytes + to * bytes;
+        out[dst..dst + row_bytes].copy_from_slice(&pixels[src..src + row_bytes]);
+    }
+    out
 }
 
 /// Flatten the visible layers into RGBA (transparent where nothing is visible), like an image editor: the shadow
@@ -167,11 +195,27 @@ pub fn flatten(stack: &Stack, pixels: usize) -> Vec<u8> {
         }
     }
     let Some((layer, ch, mode, op)) = stack.shadow else { return out };
+    let (w, (dx, dy)) = (stack.width, stack.shadow_offset);
+    let shifted;
+    let layer = if (dx, dy) == (0, 0) {
+        layer
+    } else {
+        shifted = moved(layer, ch, w, (dx, dy), 255);
+        shifted.as_slice()
+    };
+    let h = (pixels / w) as i32;
+    let covered = |i: usize| {
+        let (x, y) = ((i % w) as i32, (i / w) as i32);
+        x >= dx && x < w as i32 + dx && y >= dy && y < h + dy
+    };
     let blended = composite(&out, layer, ch, mode, op);
     let op = op.clamp(0.0, 1.0);
     let over_original = stack.original.is_some();
     let over_ai = stack.ai.is_some();
     for (i, (d, b)) in out.chunks_exact_mut(4).zip(blended.chunks_exact(4)).enumerate() {
+        if !covered(i) {
+            continue;
+        }
         let source_alpha = stack.silhouette[i * 4 + 3];
         let keep = source_alpha as f32 / 255.0;
         let below = d[3] as f32 / 255.0;
@@ -211,6 +255,8 @@ pub fn flatten_view(original: &Image8, ai_full: &[u8], layers: &Layers, view: &V
             silhouette: &original.rgba,
             ai: view.visible[AI].then_some((ai_full, view.opacity[AI])),
             shadow: view.visible[SHADOW].then_some((layers.multiply.as_slice(), channels, view.mode, view.opacity[SHADOW])),
+            shadow_offset: view.shadow_offset,
+            width: layers.w,
         },
         layers.w * layers.h,
     )
@@ -218,16 +264,19 @@ pub fn flatten_view(original: &Image8, ai_full: &[u8], layers: &Layers, view: &V
 
 /// The shadow as a layer of its own (RGBA, inside the source's silhouette): the multiply layer, or for Normal the
 /// black layer with alpha.
-pub fn shadow_rgba(layers: &Layers, mode: Mode, original: &[u8]) -> Vec<u8> {
-    let source_alpha = original.chunks_exact(4).map(|p| p[3]);
-    if mode == Mode::Normal {
-        return layers.overlay.chunks_exact(4).zip(source_alpha).flat_map(|(p, a)| [0, 0, 0, scale_alpha(p[3], a)]).collect();
-    }
-    if layers.color {
-        layers.multiply.chunks_exact(3).zip(source_alpha).flat_map(|(p, a)| [p[0], p[1], p[2], a]).collect()
+pub fn shadow_rgba(layers: &Layers, mode: Mode, original: &[u8], offset: (i32, i32)) -> Vec<u8> {
+    let rgba: Vec<u8> = if mode == Mode::Normal {
+        layers.overlay.chunks_exact(4).flat_map(|p| [0, 0, 0, p[3]]).collect()
+    } else if layers.color {
+        layers.multiply.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect()
     } else {
-        layers.multiply.iter().zip(source_alpha).flat_map(|(&v, a)| [v, v, v, a]).collect()
+        layers.multiply.iter().flat_map(|&v| [v, v, v, 255]).collect()
+    };
+    let mut rgba = moved(&rgba, 4, layers.w, offset, 0);
+    for (p, source) in rgba.chunks_exact_mut(4).zip(original.chunks_exact(4)) {
+        p[3] = scale_alpha(p[3], source[3]);
     }
+    rgba
 }
 
 fn scale_alpha(alpha: u8, by: u8) -> u8 {

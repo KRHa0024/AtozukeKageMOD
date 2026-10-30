@@ -114,6 +114,11 @@ impl App {
                         if let Some(light) = std::env::var("KAGE_LIGHT").ok().and_then(|v| v.parse().ok()) {
                             self.cfg.light_dir = light;
                         }
+                        if let Ok(offset) = std::env::var("KAGE_MOVE") {
+                            let mut parts = offset.split(',').filter_map(|v| v.parse().ok());
+                            self.set_move_mode(true);
+                            self.move_shadow(parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+                        }
                         if let Some((layer, blend)) = shot.solo {
                             self.visible = std::array::from_fn(|i| i == layer);
                             self.selected_layer = layer;

@@ -113,7 +113,7 @@ impl Case {
 }
 
 fn view(mode: Mode) -> View {
-    View { visible: [true, false, true], opacity: [0.8, 1.0, 1.0], mode }
+    View { visible: [true, false, true], opacity: [0.8, 1.0, 1.0], mode, shadow_offset: (0, 0) }
 }
 
 fn entries(dir: &Path) -> Vec<String> {
@@ -203,7 +203,7 @@ fn normal_mode_shadow_png_is_black_with_alpha() {
         let img = image::open(&out.written[0]).unwrap();
         assert!(img.color().has_alpha(), "color={color}: the Normal shadow needs an alpha channel");
         let rgba = img.to_rgba8().into_raw();
-        assert!(rgba == blend::shadow_rgba(&case.layers, Mode::Normal, &case.original.rgba), "color={color}");
+        assert!(rgba == blend::shadow_rgba(&case.layers, Mode::Normal, &case.original.rgba, (0, 0)), "color={color}");
         assert!(rgba.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
     }
 }
@@ -236,7 +236,7 @@ fn multiply_shadow_of_a_transparent_source_keeps_the_source_alpha() {
         let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
         let source: Vec<u8> = case.original.rgba.chunks_exact(4).map(|p| p[3]).collect();
         assert!(alpha == source, "color={color}: alpha");
-        assert!(rgba == blend::shadow_rgba(&case.layers, Mode::Multiply, &case.original.rgba), "color={color}");
+        assert!(rgba == blend::shadow_rgba(&case.layers, Mode::Multiply, &case.original.rgba, (0, 0)), "color={color}");
     }
 }
 
@@ -245,7 +245,7 @@ fn composite_png_of_a_transparent_source_keeps_its_alpha() {
     let case = Case::fixtures(true, false);
     for mode in MODES {
         let dir = TempDir::new("composite_alpha");
-        let v = View { visible: [true, false, true], opacity: [0.7, 1.0, 1.0], mode };
+        let v = View { visible: [true, false, true], opacity: [0.7, 1.0, 1.0], mode, shadow_offset: (0, 0) };
         let out = export::run_job(&case.job(dir.path(), v, [false, false, true], Format::Png, 90));
         assert!(out.error.is_none(), "{:?}", out.error);
         assert_eq!(names_of(&out), ["img_shaded.png"]);

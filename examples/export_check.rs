@@ -21,7 +21,7 @@ fn main() {
             shaded: &shaded,
             ai_full: &ai_full,
             layers: &l,
-            view: View { visible: [true, false, true], opacity: [0.8, 1.0, 1.0], mode: Mode::Multiply },
+            view: View { visible: [true, false, true], opacity: [0.8, 1.0, 1.0], mode: Mode::Multiply, shadow_offset: (0, 0) },
             targets: [true, true, true],
             encoding: Encoding { format, png_level: 6, quality: 92 },
             dir: &out,

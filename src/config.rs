@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::export::FORMATS;
+use crate::models::MODELS;
+
+/// target/release, target, the repository.
+const MODELS_SEARCH_DEPTH: usize = 3;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -36,10 +40,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let exe_dir = exe_dir();
         Self {
             lang: "ja".into(),
-            model_dir: exe_dir.join("models").display().to_string(),
+            model_dir: default_model_dir().display().to_string(),
             comfy_dir: String::new(),
             keep_loaded: true,
             light_dir: 4,
@@ -94,6 +97,21 @@ impl Config {
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
         std::fs::rename(tmp, data.join("settings.json"))
     }
+}
+
+/// The bundled `models` directory: next to the exe in a release, in the repository when the exe runs from `target`.
+/// Without one it is created next to the exe, or in the data directory when that is not writable.
+pub fn default_model_dir() -> PathBuf {
+    let exe = exe_dir();
+    let bundled = exe.ancestors().take(MODELS_SEARCH_DEPTH).map(|d| d.join("models")).find(|d| d.join(MODELS[0].folder).is_dir());
+    bundled.unwrap_or_else(|| {
+        let beside = exe.join("models");
+        if writable(&beside) {
+            beside
+        } else {
+            data_dir().join("models")
+        }
+    })
 }
 
 pub fn exe_dir() -> PathBuf {

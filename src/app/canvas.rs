@@ -97,8 +97,19 @@ impl App {
                 self.compare = (self.compare + h.drag_delta().x / img_rect.width()).clamp(0.0, 1.0);
             }
         }
+        let moving = self.move_mode && has_result;
+        if moving && (resp.hovered() || resp.dragged()) {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        }
         if resp.dragged() && !divider_drag {
-            self.pan += resp.drag_delta();
+            if moving {
+                self.move_rest += resp.drag_delta() / scale;
+                let whole = Vec2::new(self.move_rest.x.trunc(), self.move_rest.y.trunc());
+                self.move_rest -= whole;
+                self.move_shadow(whole.x as i32, whole.y as i32);
+            } else {
+                self.pan += resp.drag_delta();
+            }
         }
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -152,6 +163,9 @@ impl App {
             }
         }
         self.drop_outline(&ctx, &painter, rect);
+        if moving {
+            side_label(&painter, rect.left_top() + Vec2::splat(8.0), Align2::LEFT_TOP, t.moving_shadow);
+        }
         self.toast_overlay(&ctx, rect);
     }
 
@@ -213,6 +227,13 @@ impl App {
             if !models_done {
                 ui.horizontal(|ui| {
                     indent(ui);
+                    ui.label(RichText::new(t.step_models_hint).color(muted));
+                });
+                ui.horizontal(|ui| {
+                    indent(ui);
+                    if ui.button(format!("{}  {}", ph::FOLDER_OPEN, t.open_models)).on_hover_text(self.cfg.model_dir.as_str()).clicked() {
+                        open_in_explorer(std::path::Path::new(self.cfg.model_dir.trim()));
+                    }
                     let in_comfy = self.comfy_models_to_use();
                     if let Some(dir) = &in_comfy {
                         if ui.add(primary_button(t.use_models, SIZE_BODY, true)).on_hover_text(dir.display().to_string()).clicked() {

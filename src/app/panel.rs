@@ -117,11 +117,29 @@ impl App {
                 });
             });
             ui.end_row();
+            let label = ui.add(egui::Label::new(t.position).sense(Sense::click()));
+            let moved = self.entry(self.current).map_or((0, 0), |e| e.offset);
+            if label.on_hover_text(t.position_tip).double_clicked() {
+                self.move_shadow(-moved.0, -moved.1);
+            }
+            ui.add_enabled_ui(has_result && sel == SHADOW, |ui| {
+                ui.horizontal(|ui| {
+                    let (mut x, mut y) = moved;
+                    let w = (field - ui.spacing().item_spacing.x) / 2.0;
+                    let dx = ui.add_sized([w, 22.0], egui::DragValue::new(&mut x).speed(1.0).prefix("X "));
+                    let dy = ui.add_sized([w, 22.0], egui::DragValue::new(&mut y).speed(1.0).prefix("Y "));
+                    if dx.changed() || dy.changed() {
+                        self.move_shadow(x - moved.0, y - moved.1);
+                    }
+                });
+            });
+            ui.end_row();
         });
         ui.separator();
 
         let mut select = None;
         let mut eye: Option<(usize, bool)> = None;
+        let mut toggle_move = false;
         let entry_thumbs: Option<[(TextureId, Vec2); 3]> =
             self.entry(self.current).map(|e| std::array::from_fn(|i| (e.layer_thumbs[i].id(), e.layer_thumbs[i].size_vec2())));
         for &id in &ids {
@@ -171,12 +189,29 @@ impl App {
                 painter.text(lock, Align2::CENTER_CENTER, ph::LOCK_SIMPLE, FontId::proportional(14.0), MUTED);
                 ui.interact(Rect::from_center_size(lock, Vec2::splat(18.0)), Id::new("lock"), Sense::hover()).on_hover_text(t.locked);
             }
+            if id == SHADOW {
+                // Only the shadow can be moved; the original stays where it is.
+                let rect = Rect::from_min_size(Pos2::new(r.right() - 32.0, r.center().y - 14.0), Vec2::splat(28.0));
+                let button = ui.interact(rect, Id::new("move_shadow"), Sense::click());
+                let (fill, icon_color) = match (self.move_mode, button.hovered()) {
+                    (true, _) => (BLUE, Color32::WHITE),
+                    (false, true) => (HOVER, TEXT),
+                    (false, false) => (SLOT, TEXT),
+                };
+                ui.painter().rect_filled(rect, radius(), fill);
+                ui.painter().rect_stroke(rect, radius(), Stroke::new(1.0, if self.move_mode { BLUE } else { LINE }), StrokeKind::Inside);
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, ph::ARROWS_OUT_CARDINAL, FontId::proportional(SIZE_ICON), icon_color);
+                toggle_move = button.on_hover_text(t.move_tip).clicked();
+            }
         }
         if let Some(id) = select {
             self.selected_layer = id;
         }
         if let Some((id, alt)) = eye {
             self.click_eye(id, alt);
+        }
+        if toggle_move {
+            self.set_move_mode(!self.move_mode);
         }
     }
 

@@ -56,6 +56,9 @@ pub const MODELS: [ModelFile; 4] = [
     },
 ];
 
+/// Note in each model sub-directory.
+pub const NOTE_FILE: &str = "ここにモデルを入れてください.txt";
+
 pub fn total_bytes() -> u64 {
     MODELS.iter().map(|m| m.size).sum()
 }
@@ -107,9 +110,32 @@ pub fn index_of_file(path: &Path) -> Option<usize> {
     MODELS.iter().position(|m| m.file.eq_ignore_ascii_case(name))
 }
 
-/// All files are in `dir` with the right size (a quick look; the Verifier still checks the hashes).
+/// How many files are in `dir` with the right size (a quick look; the Verifier still checks the hashes).
+pub fn present_count(dir: &Path) -> usize {
+    MODELS.iter().filter(|m| stat(&model_path(dir, m)).is_some_and(|(size, _)| size == m.size)).count()
+}
+
 pub fn all_present(dir: &Path) -> bool {
-    MODELS.iter().all(|m| stat(&model_path(dir, m)).is_some_and(|(size, _)| size == m.size))
+    present_count(dir) == MODELS.len()
+}
+
+/// Create the sub-directories of `dir`, each with a note saying which file belongs there. Nothing is downloaded.
+pub fn prepare_dir(dir: &Path) -> std::io::Result<()> {
+    for m in &MODELS {
+        let folder = dir.join(m.folder);
+        std::fs::create_dir_all(&folder)?;
+        let note = folder.join(NOTE_FILE);
+        if !note.exists() {
+            let text = format!(
+                "このディレクトリに次のファイルを入れてください。\nPut this file in this directory.\n\n{}\n{:.2} GB\n{}\n",
+                m.file,
+                m.size as f64 / 1e9,
+                m.source
+            );
+            std::fs::write(note, text)?;
+        }
+    }
+    Ok(())
 }
 
 /// A free name next to `dest` for a file that is being replaced.
@@ -434,8 +460,24 @@ impl Verifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_of_file, MODELS};
+    use super::{index_of_file, present_count, prepare_dir, MODELS, NOTE_FILE};
     use std::path::Path;
+
+    #[test]
+    fn prepare_dir_makes_the_directories_and_keeps_a_note_that_exists() {
+        let dir = std::env::temp_dir().join(format!("kage-prepare-{}", std::process::id()));
+        prepare_dir(&dir).unwrap();
+        for m in &MODELS {
+            let note = dir.join(m.folder).join(NOTE_FILE);
+            assert!(std::fs::read_to_string(note).unwrap().contains(m.file));
+        }
+        let kept = dir.join(MODELS[0].folder).join(NOTE_FILE);
+        std::fs::write(&kept, "edited").unwrap();
+        prepare_dir(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "edited");
+        assert_eq!(present_count(&dir), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn files_are_recognized_by_name() {

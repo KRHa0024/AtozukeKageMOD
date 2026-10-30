@@ -9,6 +9,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, Vec2};
 use kage::blend::SHADOW;
 use kage::comfy::{self, Failure};
 use kage::export::{self, Encoding, Job, FORMATS};
+use kage::models;
 use kage::pipeline::{self, Event, Params, Request};
 use kage::shading::Image8;
 
@@ -23,9 +24,13 @@ const TOAST_SECONDS: f64 = 6.0;
 const HISTORY_LIMIT: usize = 30;
 /// A given shaded image this far off the original's aspect ratio gets a warning (model output rounds its size).
 const ASPECT_TOLERANCE: f32 = 0.02;
+/// Shift + arrow key, in image pixels.
+const MOVE_STEP_LARGE: i32 = 10;
 const IMAGE_FILTER: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
 /// Elapsed time in the status bar: no need for more frames than this during a long run.
 const RUN_REPAINT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How often the model directory is looked at while files are missing.
+const MODEL_WATCH: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The message for a failed run, in the UI's language; the raw text goes to the log.
 pub(super) fn failure_text(t: &'static T, f: &Failure) -> &'static str {
@@ -54,6 +59,7 @@ impl App {
                 }
                 self.image = Some(Input { img: Arc::new(img), tex, name });
                 self.input_filter = None;
+                self.move_mode = false;
                 self.zoom = None;
                 self.pan = Vec2::ZERO;
                 self.current = None;
@@ -200,6 +206,7 @@ impl App {
         if self.dirs_pending && !self.running() {
             self.apply_dirs();
         }
+        self.tick_models(ctx, now);
         self.tick_resolve(ctx, now);
         self.tick_export(ctx, now);
         self.tick_config(now);
@@ -236,7 +243,8 @@ impl App {
         let thumb = thumb_texture(ctx, &r.solved.shaded_thumb);
         let layer_thumbs = [thumb_texture(ctx, &r.solved.shadow_thumb), thumb_texture(ctx, &r.ai_thumb), thumb_texture(ctx, &r.original_thumb)];
         let shown = self.image.as_ref().is_some_and(|i| Arc::ptr_eq(&i.img, &input.img));
-        self.history.insert(0, Entry { id, serial: 0, input, result: *r, thumb, layer_thumbs, exported: false });
+        self.history.insert(0, Entry { id, serial: 0, input, result: *r, thumb, layer_thumbs, exported: false, offset: (0, 0) });
+        self.move_mode = false;
         self.history.truncate(HISTORY_LIMIT);
         if shown {
             self.current = Some(id);
@@ -326,6 +334,24 @@ impl App {
         let (input, shaded, id) = (e.input.clone(), e.result.shaded.clone(), e.id);
         self.spawn_run(ctx, input, params, Some(shaded));
         self.mask_run = Some(id);
+    }
+
+    /// A file put into the model directory is picked up without pressing anything.
+    fn tick_models(&mut self, ctx: &egui::Context, now: f64) {
+        if self.verifier.all_ok() || self.verifier.running() {
+            return;
+        }
+        ctx.request_repaint_after(MODEL_WATCH);
+        if now - self.models_looked_at < MODEL_WATCH.as_secs_f64() {
+            return;
+        }
+        self.models_looked_at = now;
+        let dir = PathBuf::from(self.cfg.model_dir.trim());
+        let present = models::present_count(&dir);
+        if present != self.models_seen {
+            self.models_seen = present;
+            self.verifier.start(dir);
+        }
     }
 
     fn tick_config(&mut self, now: f64) {
@@ -451,6 +477,27 @@ impl App {
         }
     }
 
+    /// Move the shown shadow layer by whole image pixels (no resampling), at most its own size away.
+    pub(super) fn move_shadow(&mut self, dx: i32, dy: i32) {
+        let Some(id) = self.current else { return };
+        let Some(e) = self.history.iter_mut().find(|e| e.id == id) else { return };
+        let (w, h) = (e.input.img.w as i32, e.input.img.h as i32);
+        let offset = ((e.offset.0 + dx).clamp(-w, w), (e.offset.1 + dy).clamp(-h, h));
+        if offset != e.offset {
+            e.offset = offset;
+            e.exported = false;
+        }
+    }
+
+    pub(super) fn set_move_mode(&mut self, on: bool) {
+        self.move_mode = on;
+        self.move_rest = Vec2::ZERO;
+        if on {
+            self.visible[SHADOW] = true;
+            self.selected_layer = SHADOW;
+        }
+    }
+
     pub(super) fn stop_run(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
@@ -480,6 +527,20 @@ impl App {
             self.zoom_by(1.0 / super::canvas::ZOOM_STEP);
         }
         self.peek_original = ctx.input(|i| i.key_down(Key::C));
+        if self.current.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
+            self.set_move_mode(!self.move_mode);
+        }
+        if self.move_mode {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.set_move_mode(false);
+            }
+            let (step, modifiers) = if ctx.input(|i| i.modifiers.shift) { (MOVE_STEP_LARGE, Modifiers::SHIFT) } else { (1, Modifiers::NONE) };
+            for (key, dx, dy) in [(Key::ArrowLeft, -step, 0), (Key::ArrowRight, step, 0), (Key::ArrowUp, 0, -step), (Key::ArrowDown, 0, step)] {
+                if ctx.input_mut(|i| i.consume_key(modifiers, key)) {
+                    self.move_shadow(dx, dy);
+                }
+            }
+        }
     }
 }
 

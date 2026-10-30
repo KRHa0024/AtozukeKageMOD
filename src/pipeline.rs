@@ -316,7 +316,7 @@ pub fn solve(original: &Image8, shaded: &Image8, mask: Option<&(Vec<u8>, usize, 
         s.reconstruction_error
     ));
     let shaded_thumb = thumbnail(&layers.preview, layers.w, layers.h);
-    let shadow_thumb = thumbnail(&blend::shadow_rgba(&layers, Mode::Multiply, &original.rgba), layers.w, layers.h);
+    let shadow_thumb = thumbnail(&blend::shadow_rgba(&layers, Mode::Multiply, &original.rgba, (0, 0)), layers.w, layers.h);
     // Only the thumbnail needs it; history keeps many results.
     layers.preview = Vec::new();
     Solved { layers: Arc::new(layers), shaded_thumb, shadow_thumb }

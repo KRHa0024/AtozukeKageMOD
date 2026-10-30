@@ -21,7 +21,7 @@ use kage::comfy::{Comfy, Failure};
 use kage::config::{self, Config};
 use kage::export::Outcome;
 use kage::log::Log;
-use kage::models::Verifier;
+use kage::models::{self, Verifier};
 use kage::pipeline::{Event, Params, RunResult, Solved};
 use kage::shading::Image8;
 
@@ -68,6 +68,8 @@ struct Entry {
     layer_thumbs: [TextureHandle; 3],
     /// Written out since the last change, so quitting loses nothing.
     exported: bool,
+    /// Where the shadow layer was moved to, in image pixels.
+    offset: (i32, i32),
 }
 
 struct Resolve {
@@ -94,6 +96,9 @@ pub struct App {
     applied_dirs: (String, String),
     /// A directory changed during a run: applied when the run ends.
     dirs_pending: bool,
+    /// Model files seen in the model directory, and when it was last looked at.
+    models_seen: usize,
+    models_looked_at: f64,
     log: Log,
     verifier: Verifier,
     comfy: Comfy,
@@ -133,6 +138,10 @@ pub struct App {
     compare: f32,
     /// Hold C: the original over everything.
     peek_original: bool,
+    /// Dragging on the canvas moves the shadow layer.
+    move_mode: bool,
+    /// The part of a drag below one image pixel.
+    move_rest: Vec2,
     zoom: Option<f32>,
     /// Points per image pixel, as drawn last.
     scale: f32,
@@ -167,6 +176,11 @@ impl App {
         if let Some(e) = cfg_error {
             log.warn(e);
         }
+        if Path::new(&cfg.model_dir) == config::default_model_dir() {
+            if let Err(e) = models::prepare_dir(Path::new(&cfg.model_dir)) {
+                log.warn(format!("Could not prepare {}: {e}", cfg.model_dir));
+            }
+        }
         let verifier = Verifier::new(&data, log.clone());
         let comfy = Comfy::new(&data, log.clone());
         verifier.start(PathBuf::from(&cfg.model_dir));
@@ -178,6 +192,8 @@ impl App {
             settings_tab: COMFY_TAB,
             applied_dirs: (cfg.model_dir.clone(), cfg.comfy_dir.clone()),
             dirs_pending: false,
+            models_seen: 0,
+            models_looked_at: 0.0,
             post_seen: (cfg.strength, cfg.gray, cfg.ghost, cfg.bg_shadow),
             saved_cfg: cfg.clone(),
             cfg,
@@ -212,6 +228,8 @@ impl App {
             compare_on: false,
             compare: 0.5,
             peek_original: false,
+            move_mode: false,
+            move_rest: Vec2::ZERO,
             zoom: None,
             scale: 1.0,
             pan: Vec2::ZERO,
@@ -243,7 +261,8 @@ impl App {
     }
 
     fn view(&self) -> View {
-        View { visible: self.visible, opacity: self.opacity, mode: MODES[self.cfg.blend] }
+        let shadow_offset = self.entry(self.current).map_or((0, 0), |e| e.offset);
+        View { visible: self.visible, opacity: self.opacity, mode: MODES[self.cfg.blend], shadow_offset }
     }
 
     fn entry(&self, id: Option<u64>) -> Option<&Entry> {
