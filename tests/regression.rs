@@ -1,4 +1,4 @@
-//! The Rust shadow layer must match the Python reference (orchestrator shading.py) on the fixtures made by
+//! The Rust shadow layer must match the Python reference (tests/reference/shading.py) on the fixtures made by
 //! tests/gen_fixtures.py. Set KAGE_FIXTURES=<dir> to run against another fixture set (e.g. real images).
 
 use std::path::PathBuf;

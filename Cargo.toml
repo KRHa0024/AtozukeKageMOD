@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Atozuke Kage MOD: add AI shading to an image as a separate shadow layer"
 license = "MIT"
+repository = "https://github.com/KRHa0024/AtozukeKageMOD"
 publish = false
 
 [lib]

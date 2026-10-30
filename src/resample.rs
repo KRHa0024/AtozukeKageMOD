@@ -1,5 +1,5 @@
 //! Pillow-compatible resampling and blurring, so the shadow layer matches the Python reference
-//! (orchestrator/src/orchestrator/shading.py) value for value instead of "about the same".
+//! (tests/reference/shading.py) value for value instead of "about the same".
 //!
 //! Ported from Pillow's libImaging (Resample.c, BoxBlur.c, AlphaComposite.c, Convert.c).
 

@@ -1,7 +1,7 @@
 //! One shading run: AI shading (Qwen-Image 2.1 instruction edit) -> subject mask (BiRefNet) -> shadow layer.
 //!
-//! The ComfyUI graphs and parameters are the workbench orchestrator's `shade` task (service.py `_check_shade` /
-//! `_shade`, workflows edit/qwen_image_2_1_edit and utilities/remove_background_birefnet), so results are the same.
+//! The ComfyUI graphs (Comfy-Org templates image_qwen_image_2_1 edit and utility_birefnet_remove_background, both
+//! core nodes only) and the parameters are the ones the shading was tuned with; keep them unchanged.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -16,7 +16,8 @@ use crate::log::Log;
 use crate::models::{Verifier, MODELS};
 use crate::shading::{self, Image8, Layers, Options};
 
-/// Tuned on VRChat / anime renders (workbench docs/research/phase7-features.md).
+/// Tuned on VRChat / anime renders: asking for "natural, only darken" made the model grade the whole image (pink
+/// hair turned brown); illustration-style shading keeps colors and gives defined shadow shapes.
 const SHADE_PROMPT: &str = "Add strong, beautiful anime-style shading to the characters, like a professionally shaded illustration{light}: crisp shadow shapes under the bangs and on the neck, under the chin, on the inner sides of the arms and legs, in clothing folds and where parts overlap, with soft gradients on the turned-away side. Highlights and lit areas stay exactly as in the original. Keep all colors, the face, every detail, the background and the framing exactly the same; only add shadows.";
 /// Sources larger than this are shaded at a higher model resolution (finer shadow shapes for 4K renders).
 const LARGE_SOURCE_PIXELS: usize = 2_500_000;
@@ -321,7 +322,7 @@ fn load_output(files: &[PathBuf]) -> Result<Image8, RunError> {
     Ok(Image8::from_dynamic(&img))
 }
 
-/// The original as PNG for ComfyUI's LoadImage (alpha kept, as the orchestrator uploads the file as is).
+/// The original as PNG for ComfyUI's LoadImage (alpha kept, like passing the file as is).
 fn write_png(img: &Image8, path: &Path) -> image::ImageResult<()> {
     use image::ImageEncoder;
     if let Some(dir) = path.parent() {

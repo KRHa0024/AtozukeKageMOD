@@ -1,9 +1,8 @@
 """Generate regression fixtures for the Rust shadow-layer port from the Python reference.
 
-Run with the orchestrator environment (it provides the reference implementation and Pillow/numpy):
+Needs numpy and Pillow; the reference implementation is tests/reference/shading.py:
 
-    cd orchestrator
-    uv run --no-sync python ../kage-mod/tests/gen_fixtures.py ../kage-mod/tests/fixtures
+    uv run --with numpy --with pillow python tests/gen_fixtures.py tests/fixtures
     # real images (not committed): --original o.png --shaded s.png --cutout c.png <out_dir>
 
 Synthetic inputs are drawn here so the committed fixtures contain no third-party images.
@@ -13,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-from orchestrator import shading
+sys.path.insert(0, str(Path(__file__).parent / "reference"))
+import shading  # noqa: E402
 
 CASES = {
     # name: (shadow_layers kwargs, use mask, shaded at original size)

@@ -1,6 +1,6 @@
 //! Shadow layers: the layer that turns an original image into a shaded version of it.
 //!
-//! Port of orchestrator/src/orchestrator/shading.py (same math, same resampling; see tests/regression.rs).
+//! Port of tests/reference/shading.py (same math, same resampling; see tests/regression.rs).
 //! Given the original O and a shaded version S, the shadow layer L satisfies O x L ~= S. L is solved per pixel at
 //! the shaded image's resolution, then brought to the original's resolution by guided upsampling, so its edges
 //! follow the full-resolution original. Only darkening is kept (L <= 1).
@@ -372,8 +372,8 @@ pub fn shadow_layers(original: &Image8, shaded: &Image8, mask: Option<(&[u8], us
     }
 }
 
-/// Subject mask from a background-removal cutout (alpha channel), softened like the orchestrator
-/// (`GaussianBlur(1.5)`).
+/// Subject mask from a background-removal cutout (alpha channel), softened with Pillow's
+/// `GaussianBlur(1.5)` as in the reference pipeline.
 pub fn subject_mask(cutout: &image::DynamicImage) -> (Vec<u8>, usize, usize) {
     let rgba = cutout.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);

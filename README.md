@@ -74,7 +74,7 @@ exe のフォルダに書き込めないときは `%LOCALAPPDATA%\AtozukeKageMOD
 
 ## ライセンスと責任
 
-- このアプリは MIT ライセンスです。
+- このアプリは [MIT ライセンス](LICENSE) です。
 - ComfyUI とモデルは同梱していません。それぞれのライセンスに従って、利用者自身の責任で入手・利用してください。
   Qwen-Image 2.1 のライセンスには利用条件があります。商用利用の前に必ず確認してください。
 - 生成した画像の扱いは利用者の責任です。
@@ -89,13 +89,13 @@ cargo build --release
 
 ### テスト
 
-影レイヤーの計算は、ワークベンチのオーケストレーター（`orchestrator/src/orchestrator/shading.py`）の Rust 移植です。
+影レイヤーの計算は、Python の参照実装（[tests/reference/shading.py](tests/reference/shading.py)）の Rust 移植です。
 `tests/regression.rs` で、Python 版が出力した期待値と画素単位で比べています（許容誤差は 8bit で ±1）。
 
 ```
 cargo test --release
-# 期待値を作り直す（Python 側のオーケストレーター環境で）
-cd ../orchestrator && uv run --no-sync python ../kage-mod/tests/gen_fixtures.py ../kage-mod/tests/fixtures
+# 期待値を作り直す（numpy と Pillow が必要）
+uv run --with numpy --with pillow python tests/gen_fixtures.py tests/fixtures
 ```
 
 `examples/smoke.rs` は、UI を使わずに ComfyUI の起動から影レイヤーの保存までを 1 回通すスモークテストです。
