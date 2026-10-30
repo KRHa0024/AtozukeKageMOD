@@ -8,7 +8,7 @@ use kage::pipeline::AUTO_LIGHT;
 use super::status::clock;
 use super::{App, Phase, Screen, COMFY_TAB, MODELS_TAB};
 use crate::i18n::{Lang, T};
-use crate::theme::{primary_button, AMBER, BLUE, CONTROL_EDGE, GREEN, LINE, MUTED, PANEL, RED, SIZE_ICON, SIZE_TITLE, TEXT};
+use crate::theme::{icon_button, primary_button, text_field, ACTION_HEIGHT, AMBER, BLUE, CONTROL_EDGE, CONTROL_HEIGHT, GAP, GREEN, LINE, MUTED, PADDING_I, PANEL, RED, SECTION_GAP, SIZE_ICON, SIZE_TITLE, TEXT, VALUE_WIDTH};
 
 const DIR_ICONS: [&str; 9] = [
     ph::ARROW_DOWN_RIGHT,
@@ -22,16 +22,12 @@ const DIR_ICONS: [&str; 9] = [
     ph::ARROW_UP_LEFT,
 ];
 
-const LIGHT_CELL_HEIGHT: f32 = 28.0;
 const STRENGTH_DEFAULT: f32 = 1.0;
 const STOP_WIDTH: f32 = 84.0;
-const ACTION_HEIGHT: f32 = 48.0;
 /// Height of the guide area above Generate, so the buttons do not move with its text.
 const GUIDE_HEIGHT: f32 = 44.0;
 /// Sources above this take the longer time in the guide (the model runs at its higher resolution).
 const LARGE_SOURCE_PIXELS: usize = 2_500_000;
-/// Width of the strength value field.
-const VALUE_WIDTH: f32 = 66.0;
 
 /// One thing that is not ready yet.
 struct Part {
@@ -57,7 +53,7 @@ impl App {
                 self.pick_shaded(&ctx);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button(ph::GEAR_SIX).on_hover_text(t.settings).clicked() {
+                if icon_button(ui, ph::GEAR_SIX).on_hover_text(t.settings).clicked() {
                     self.screen = Screen::Settings;
                 }
                 let (text, color, tip, tab) = self.readiness(t);
@@ -70,7 +66,7 @@ impl App {
                 }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     if let Some(img) = &self.image {
-                        ui.add_space(6.0);
+                        ui.add_space(SECTION_GAP);
                         ui.add(egui::Label::new(&img.name).truncate()).on_hover_text(&img.name);
                         ui.label(RichText::new(format!("{}×{}", img.img.w, img.img.h)).monospace().color(MUTED));
                     }
@@ -199,8 +195,9 @@ impl App {
         let ready = self.ready();
         let unapplied = self.unapplied(t);
 
-        egui::Panel::bottom("generate").frame(Frame::new().fill(PANEL).inner_margin(Margin::symmetric(0, 10))).show(ui, |ui| {
-            self.guide(ui, t, &unapplied);
+        // The line above the buttons is level with the one above Export on the other side.
+        let action = Frame::new().fill(PANEL).inner_margin(Margin { left: 0, right: 0, top: PADDING_I, bottom: 0 });
+        egui::Panel::bottom("generate").frame(action).resizable(false).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let w = ui.available_width() - STOP_WIDTH - ui.spacing().item_spacing.x;
                 let enabled = self.image.is_some() && !running && ready;
@@ -217,6 +214,8 @@ impl App {
                 }
             });
         });
+        let guide = Frame::new().fill(PANEL).inner_margin(Margin { left: 0, right: 0, top: 0, bottom: GAP as i8 });
+        egui::Panel::bottom("guide").frame(guide).resizable(false).show_separator_line(false).show(ui, |ui| self.guide(ui, t, &unapplied));
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // Before the setup is done, the guide on the canvas is the only thing to look at.
@@ -226,17 +225,16 @@ impl App {
 
     /// Everything that decides the shadow, in the order it is decided.
     fn shadow_settings(&mut self, ui: &mut egui::Ui, t: &'static T) {
-        ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new(t.light_dir).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(t.light_short[self.cfg.light_dir]).color(MUTED)));
         });
-        let w = (ui.available_width() - 6.0) / 3.0;
-        egui::Grid::new("dirs").spacing([3.0, 3.0]).show(ui, |ui| {
+        let w = (ui.available_width() - GAP * 2.0) / 3.0;
+        egui::Grid::new("dirs").spacing([GAP, GAP]).show(ui, |ui| {
             for (i, icon) in DIR_ICONS.iter().enumerate() {
                 let text = if i == AUTO_LIGHT { RichText::new(t.light_auto) } else { RichText::new(*icon).size(SIZE_ICON) };
                 let b = egui::Button::new(text).selected(self.cfg.light_dir == i);
-                if ui.add_sized([w, LIGHT_CELL_HEIGHT], b).on_hover_text(t.light_tips[i]).clicked() {
+                if ui.add_sized([w, CONTROL_HEIGHT], b).on_hover_text(t.light_tips[i]).clicked() {
                     self.cfg.light_dir = i;
                 }
                 if i % 3 == 2 {
@@ -245,7 +243,7 @@ impl App {
             }
         });
 
-        ui.add_space(12.0);
+        ui.add_space(SECTION_GAP);
         ui.horizontal(|ui| {
             let label = ui.add(egui::Label::new(RichText::new(t.strength).strong()).sense(Sense::click()));
             if label.on_hover_text(format!("{}\n{}", t.strength_tip, t.reset_tip)).double_clicked() {
@@ -255,33 +253,41 @@ impl App {
             let slider = ui.add(egui::Slider::new(&mut self.cfg.strength, 0.5..=1.5).step_by(0.05).show_value(false));
             // The neutral value.
             ui.painter().vline(slider.rect.center().x, slider.rect.y_range(), Stroke::new(1.0, CONTROL_EDGE));
-            ui.add_sized([VALUE_WIDTH, 22.0], egui::DragValue::new(&mut self.cfg.strength).range(0.5..=1.5).speed(0.01).fixed_decimals(2).prefix("× "));
+            ui.add_sized([VALUE_WIDTH, CONTROL_HEIGHT], egui::DragValue::new(&mut self.cfg.strength).range(0.5..=1.5).speed(0.01).fixed_decimals(2).prefix("× "));
         });
-        ui.add_space(6.0);
         ui.checkbox(&mut self.cfg.bg_shadow, t.bg_shadow).on_hover_text(t.bg_tip);
         ui.checkbox(&mut self.cfg.gray, t.gray).on_hover_text(t.gray_tip);
         ui.checkbox(&mut self.cfg.ghost, t.ghost).on_hover_text(t.ghost_desc);
 
-        ui.add_space(8.0);
+        ui.add_space(SECTION_GAP);
         ui.separator();
         let changed = [!self.cfg.extra.trim().is_empty(), self.seed.trim() != "random"].iter().filter(|&&on| on).count();
         let title = if changed > 0 { format!("{}{}{changed}{}", t.advanced, t.paren.0, t.paren.1) } else { t.advanced.to_string() };
-        egui::CollapsingHeader::new(RichText::new(title).strong()).id_salt("advanced").default_open(self.adv_default_open).show(ui, |ui| {
-            ui.label(t.extra);
-            ui.add(egui::TextEdit::singleline(&mut self.cfg.extra).hint_text("warm sunset light").desired_width(f32::INFINITY));
-            ui.add_space(8.0);
-            ui.label(t.seed);
-            let seed_ok = self.seed.trim() == "random" || self.seed.trim().parse::<u64>().is_ok();
-            ui.horizontal(|ui| {
-                let edit = egui::TextEdit::singleline(&mut self.seed).desired_width(ui.available_width() - 34.0).text_color(if seed_ok { TEXT } else { RED });
-                ui.add(edit);
-                if ui.button(ph::ARROWS_CLOCKWISE).on_hover_text(t.seed_random).clicked() {
-                    self.seed = "random".into();
-                }
-            });
-            if !seed_ok {
-                ui.label(RichText::new(t.seed_invalid).small().color(RED));
+        ui.horizontal(|ui| {
+            let icon = if self.adv_open { ph::CARET_DOWN } else { ph::CARET_RIGHT };
+            let header = ui.add(egui::Label::new(RichText::new(format!("{icon}  {title}")).strong()).selectable(false).sense(Sense::click()));
+            if header.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                self.adv_open = !self.adv_open;
             }
         });
+        if !self.adv_open {
+            return;
+        }
+        ui.label(t.extra);
+        let width = ui.available_width();
+        ui.add(text_field(&mut self.cfg.extra, width).hint_text("warm sunset light"));
+        ui.add_space(SECTION_GAP);
+        ui.label(t.seed);
+        let seed_ok = self.seed.trim() == "random" || self.seed.trim().parse::<u64>().is_ok();
+        ui.horizontal(|ui| {
+            let width = ui.available_width() - CONTROL_HEIGHT - GAP;
+            ui.add(text_field(&mut self.seed, width).text_color(if seed_ok { TEXT } else { RED }));
+            if icon_button(ui, ph::ARROWS_CLOCKWISE).on_hover_text(t.seed_random).clicked() {
+                self.seed = "random".into();
+            }
+        });
+        if !seed_ok {
+            ui.label(RichText::new(t.seed_invalid).small().color(RED));
+        }
     }
 }

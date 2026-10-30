@@ -64,7 +64,6 @@ impl App {
         let now = ui.input(|i| i.time);
         let running = self.running();
         let resolving = self.resolve.is_some();
-        ui.add_space(4.0);
         let (icon, color) = match self.phase {
             _ if running || resolving => (ph::CIRCLE_NOTCH, BLUE),
             Phase::Done => (ph::CHECK_CIRCLE, GREEN),

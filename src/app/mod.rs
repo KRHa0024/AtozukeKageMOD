@@ -26,7 +26,7 @@ use kage::pipeline::{Event, Params, RunResult, Solved};
 use kage::shading::Image8;
 
 use crate::i18n::{t, Lang, T};
-use crate::theme::{self, BG, CANVAS_SHADES, LINE, PANEL};
+use crate::theme::{self, BAR_HEIGHT, BG, CANVAS_SHADES, LINE, PADDING_I, PANEL};
 use shot::Shot;
 use views::Views;
 
@@ -161,7 +161,9 @@ pub struct App {
     window_size: Option<[f32; 2]>,
     log_level: usize,
     log_seen: u64,
-    adv_default_open: bool,
+    adv_open: bool,
+    /// Width of the compare and zoom row in the last frame, for centering it.
+    view_tools_width: f32,
     shot: Option<Shot>,
 }
 
@@ -246,7 +248,8 @@ impl App {
             window_size: None,
             log_level: 0,
             log_seen: 0,
-            adv_default_open: false,
+            adv_open: false,
+            view_tools_width: 0.0,
             shot: None,
         }
         .with_scene(&cc.egui_ctx)
@@ -305,17 +308,16 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
-        let bar = Frame::new().fill(PANEL).inner_margin(Margin::symmetric(6, 4)).stroke(Stroke::new(1.0, LINE));
-        let side = Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, LINE));
-        let padded = Frame::new().fill(PANEL).inner_margin(Margin::same(8)).stroke(Stroke::new(1.0, LINE));
+        let bar = Frame::new().fill(PANEL).inner_margin(Margin::symmetric(PADDING_I, 4)).stroke(Stroke::new(1.0, LINE));
+        let side = Frame::new().fill(PANEL).inner_margin(Margin::same(PADDING_I)).stroke(Stroke::new(1.0, LINE));
         match self.screen {
             Screen::Main => {
-                egui::Panel::top("toolbar").frame(bar).exact_size(36.0).show(ui, |ui| self.toolbar(ui));
-                egui::Panel::bottom("status").frame(bar).exact_size(40.0).show(ui, |ui| self.status_bar(ui));
+                egui::Panel::top("toolbar").frame(bar).exact_size(BAR_HEIGHT).show(ui, |ui| self.toolbar(ui));
+                egui::Panel::bottom("status").frame(bar).exact_size(BAR_HEIGHT).show(ui, |ui| self.status_bar(ui));
                 egui::Panel::left("controls").frame(side).exact_size(270.0).resizable(false).show_separator_line(false).show(ui, |ui| self.controls(ui));
                 self.ensure_views(&ctx);
-                egui::Panel::right("right").frame(padded).exact_size(280.0).resizable(false).show_separator_line(false).show(ui, |ui| self.right_panel(ui));
-                egui::Panel::bottom("view_tools").frame(bar).exact_size(36.0).show(ui, |ui| self.view_tools(ui));
+                egui::Panel::right("right").frame(side).exact_size(280.0).resizable(false).show_separator_line(false).show(ui, |ui| self.right_panel(ui));
+                egui::Panel::bottom("view_tools").frame(bar).exact_size(BAR_HEIGHT).show(ui, |ui| self.view_tools(ui));
                 let canvas = Frame::new().fill(CANVAS_SHADES[self.cfg.canvas_shade]);
                 egui::CentralPanel::default().frame(canvas).show(ui, |ui| self.canvas(ui));
                 if self.export_open {
@@ -323,10 +325,10 @@ impl eframe::App for App {
                 }
             }
             Screen::Settings => {
-                egui::Panel::top("settings_toolbar").frame(bar).exact_size(36.0).show(ui, |ui| self.settings_toolbar(ui));
-                egui::Panel::bottom("status").frame(bar).exact_size(40.0).show(ui, |ui| self.status_bar(ui));
-                egui::Panel::left("settings_nav").frame(padded).exact_size(180.0).resizable(false).show_separator_line(false).show(ui, |ui| self.settings_nav(ui));
-                egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(12))).show(ui, |ui| self.settings_body(ui));
+                egui::Panel::top("settings_toolbar").frame(bar).exact_size(BAR_HEIGHT).show(ui, |ui| self.settings_toolbar(ui));
+                egui::Panel::bottom("status").frame(bar).exact_size(BAR_HEIGHT).show(ui, |ui| self.status_bar(ui));
+                egui::Panel::left("settings_nav").frame(side).exact_size(180.0).resizable(false).show_separator_line(false).show(ui, |ui| self.settings_nav(ui));
+                egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(PADDING_I))).show(ui, |ui| self.settings_body(ui));
             }
         }
         if self.quit_open {

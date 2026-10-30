@@ -1,7 +1,7 @@
 //! The canvas: pan, zoom, compare, and the overlays on it. What is drawn here is how the user judges the shadows, so
 //! scale means device pixels per image pixel in everything the user sees.
 
-use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
 use egui_phosphor::regular as ph;
 
 use kage::comfy;
@@ -9,14 +9,16 @@ use kage::models::MODELS;
 
 use super::settings::open_in_explorer;
 use super::{App, Screen, MODELS_TAB};
-use crate::theme::{checkerboard, primary_button, radius, BLUE, GREEN, LINE_DARK, MUTED, PANEL, RED, SIZE_BODY, SIZE_ICON, SIZE_SMALL, SIZE_TITLE, TEXT};
+use crate::theme::{checkerboard, icon_button, primary_button, radius, BLUE, CONTROL_HEIGHT, GAP, GREEN, LINE_DARK, MUTED, PADDING_I, PANEL, RED, SECTION_GAP, SIZE_BODY, SIZE_ICON, SIZE_SMALL, SIZE_TITLE, TEXT};
 
 /// Step of the zoom buttons and keys.
 pub(super) const ZOOM_STEP: f32 = 1.25;
 const SETUP_WIDTH: f32 = 460.0;
-const SETUP_HEIGHT: f32 = 300.0;
-/// Width of the compare and zoom row, for centering it.
-const VIEW_TOOLS_WIDTH: f32 = 300.0;
+const SETUP_HEIGHT: f32 = 320.0;
+/// Column of the step numbers in the setup guide.
+const STEP_MARK: f32 = 20.0;
+/// Room for the zoom value, so the buttons around it stay put.
+const ZOOM_VALUE_WIDTH: f32 = 44.0;
 const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.05..=16.0;
 /// Canvas margin around the fitted image.
 const FIT_MARGIN: f32 = 48.0;
@@ -178,7 +180,7 @@ impl App {
             ui.visuals_mut().override_text_color = Some(text);
             ui.label(RichText::new(t.setup_title).strong().size(SIZE_TITLE));
             ui.label(RichText::new(t.setup_requirements).color(muted));
-            ui.add_space(14.0);
+            ui.add_space(SECTION_GAP);
 
             let comfy_state = self.comfy.state();
             let comfy_done = matches!(comfy_state, comfy::State::Ready { .. } | comfy::State::Starting);
@@ -186,15 +188,18 @@ impl App {
             let step = |ui: &mut egui::Ui, n: usize, done: bool, active: bool, title: &str, detail: &str| {
                 let color = if done || active { text } else { muted };
                 let mark = if done { ph::CHECK_CIRCLE.to_string() } else { n.to_string() };
-                ui.horizontal(|ui| {
-                    ui.add_sized([20.0, 20.0], egui::Label::new(RichText::new(mark).color(if done { GREEN } else { color }).strong()));
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(Vec2::splat(STEP_MARK), Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_min_width(STEP_MARK);
+                        ui.label(RichText::new(mark).color(if done { GREEN } else { color }).strong());
+                    });
                     ui.vertical(|ui| {
                         ui.label(RichText::new(title).strong().color(color));
                         ui.label(RichText::new(detail).color(muted));
                     });
                 });
             };
-            let indent = |ui: &mut egui::Ui| ui.add_space(26.0);
+            let indent = |ui: &mut egui::Ui| ui.add_space(STEP_MARK + GAP);
 
             let comfy_detail = match comfy_state {
                 comfy::State::NotSet => t.step_comfy_detail,
@@ -219,16 +224,15 @@ impl App {
                     }
                 });
             }
-            ui.add_space(10.0);
+            ui.add_space(SECTION_GAP);
 
             let present = self.verifier.statuses().iter().filter(|s| **s == kage::models::Status::Ok).count();
-            let detail = t.step_models_detail.replace("{total}", &MODELS.len().to_string()).replace("{done}", &present.to_string());
+            let mut detail = t.step_models_detail.replace("{total}", &MODELS.len().to_string()).replace("{done}", &present.to_string());
+            if !models_done {
+                detail = format!("{detail}\n{}", t.step_models_hint);
+            }
             step(ui, 2, models_done, comfy_done, t.step_models, &detail);
             if !models_done {
-                ui.horizontal(|ui| {
-                    indent(ui);
-                    ui.label(RichText::new(t.step_models_hint).color(muted));
-                });
                 ui.horizontal(|ui| {
                     indent(ui);
                     if ui.button(format!("{}  {}", ph::FOLDER_OPEN, t.open_models)).on_hover_text(self.cfg.model_dir.as_str()).clicked() {
@@ -247,7 +251,7 @@ impl App {
                     }
                 });
             }
-            ui.add_space(10.0);
+            ui.add_space(SECTION_GAP);
 
             step(ui, 3, false, false, t.step_image, t.step_image_detail);
         });
@@ -260,19 +264,20 @@ impl App {
         let has_image = self.image.is_some();
         let has_result = self.current.is_some();
         ui.horizontal_centered(|ui| {
-            ui.add_space(((ui.available_width() - VIEW_TOOLS_WIDTH) / 2.0).max(0.0));
+            ui.add_space(((ui.available_width() - self.view_tools_width) / 2.0).max(0.0));
+            let left = ui.cursor().left();
             let compare = egui::Button::new(format!("{}  {}", ph::SQUARE_SPLIT_HORIZONTAL, t.compare)).selected(has_result && self.compare_on);
             if ui.add_enabled(has_result, compare).on_hover_text(t.compare_tip).clicked() {
                 self.compare_on = !self.compare_on;
             }
             ui.separator();
             ui.add_enabled_ui(has_image, |ui| {
-                if ui.button("−").on_hover_text(t.zoom_out).clicked() {
+                if icon_button(ui, ph::MINUS).on_hover_text(t.zoom_out).clicked() {
                     self.zoom_by(1.0 / ZOOM_STEP);
                 }
-                let percent = if has_image { format!("{:>4.0}%", self.scale * ctx.pixels_per_point() * 100.0) } else { "   -%".to_string() };
-                ui.label(RichText::new(percent).monospace());
-                if ui.button("+").on_hover_text(t.zoom_in).clicked() {
+                let percent = if has_image { format!("{:.0}%", self.scale * ctx.pixels_per_point() * 100.0) } else { "-%".to_string() };
+                ui.add_sized([ZOOM_VALUE_WIDTH, CONTROL_HEIGHT], egui::Label::new(RichText::new(percent).monospace()));
+                if icon_button(ui, ph::PLUS).on_hover_text(t.zoom_in).clicked() {
                     self.zoom_by(ZOOM_STEP);
                 }
                 if ui.button(t.fit).on_hover_text(t.fit_tip).clicked() {
@@ -282,6 +287,7 @@ impl App {
                     self.zoom_actual(&ctx);
                 }
             });
+            self.view_tools_width = ui.cursor().left() - left - GAP;
         });
     }
 
@@ -295,12 +301,12 @@ impl App {
     /// Messages at the top of the canvas. Failures stay until closed.
     fn toast_overlay(&mut self, ctx: &egui::Context, rect: Rect) {
         let t = self.t();
-        let overlay = Frame::new().fill(PANEL).stroke(Stroke::new(1.0, LINE_DARK)).corner_radius(radius()).inner_margin(Margin::symmetric(6, 4));
+        let overlay = Frame::new().fill(PANEL).stroke(Stroke::new(1.0, LINE_DARK)).corner_radius(radius()).inner_margin(Margin::symmetric(PADDING_I, 4));
         let mut close = false;
         if let Some(toast) = &self.toast {
             let mut open_dir = None;
             egui::Area::new(Id::new("toast"))
-                .fixed_pos(rect.center_top() + Vec2::new(0.0, 12.0))
+                .fixed_pos(rect.center_top() + Vec2::new(0.0, SECTION_GAP))
                 .pivot(Align2::CENTER_TOP)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {

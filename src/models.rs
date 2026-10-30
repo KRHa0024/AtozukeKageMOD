@@ -220,6 +220,16 @@ impl Verifier {
         });
     }
 
+    /// Check the files in `dir` again from their content: the recorded hashes are dropped first.
+    pub fn recheck(&self, dir: PathBuf) {
+        let mut cache = self.load_cache();
+        for m in &MODELS {
+            cache.remove(&model_path(&dir, m).display().to_string());
+        }
+        let _ = std::fs::write(&self.cache_path, serde_json::to_vec_pretty(&cache).unwrap_or_default());
+        self.start(dir);
+    }
+
     fn cancelled(&self, gen: u64) -> bool {
         self.generation.load(Ordering::SeqCst) != gen
     }
@@ -447,7 +457,26 @@ impl Verifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{present_count, prepare_dir, MODELS, NOTE_FILE};
+    use super::{model_path, present_count, prepare_dir, Seen, Verifier, MODELS, NOTE_FILE};
+    use crate::log::Log;
+    use std::collections::HashMap;
+
+    #[test]
+    fn recheck_drops_the_recorded_hashes_of_this_directory_only() {
+        let dir = std::env::temp_dir().join(format!("kage-recheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let models = dir.join("models");
+        let seen = || Seen { size: 1, mtime: 1, sha256: "x".into() };
+        let mut cache = HashMap::new();
+        cache.insert(model_path(&models, &MODELS[0]).display().to_string(), seen());
+        cache.insert("elsewhere".to_string(), seen());
+        let path = dir.join("verified.json");
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        let verifier = Verifier::new(&dir, Log::new(&dir.join("logs")));
+        verifier.recheck(models);
+        let after: HashMap<String, Seen> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after.keys().collect::<Vec<_>>(), ["elsewhere"]);
+    }
 
     #[test]
     fn prepare_dir_makes_the_directories_and_keeps_a_note_that_exists() {

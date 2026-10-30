@@ -26,6 +26,21 @@ pub const SLOT: Color32 = Color32::from_gray(0xf8);
 /// Canvas surround: light, mid gray, dark.
 pub const CANVAS_SHADES: [Color32; 3] = [Color32::from_gray(0xe3), Color32::from_gray(0x80), Color32::from_gray(0x3a)];
 
+/// Buttons, fields and combo boxes, whatever is next to each other on a line.
+pub const CONTROL_HEIGHT: f32 = 28.0;
+/// Generate and Export.
+pub const ACTION_HEIGHT: f32 = 48.0;
+/// Top bar, status bar and the view tools.
+pub const BAR_HEIGHT: f32 = 36.0;
+/// Number fields next to a slider.
+pub const VALUE_WIDTH: f32 = 66.0;
+/// From the window and panel edges to their content.
+pub const PADDING_I: i8 = 10;
+/// Between items of a group.
+pub const GAP: f32 = 6.0;
+/// Between groups.
+pub const SECTION_GAP: f32 = 12.0;
+
 pub const SIZE_SMALL: f32 = 12.0;
 pub const SIZE_BODY: f32 = 13.0;
 pub const SIZE_TITLE: f32 = 16.0;
@@ -45,6 +60,26 @@ pub fn primary_button(text: impl Into<String>, size: f32, enabled: bool) -> egui
     } else {
         egui::Button::new(text)
     }
+}
+
+/// A one-line text field of the common height.
+pub fn text_field(text: &mut String, width: f32) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).desired_width(width).min_size(Vec2::new(width, CONTROL_HEIGHT)).vertical_align(egui::Align::Center)
+}
+
+/// A square button with only an icon, as high as the fields next to it.
+pub fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
+    ui.scope(|ui| {
+        // The icon's line height plus the usual padding would make it taller.
+        ui.spacing_mut().button_padding = Vec2::ZERO;
+        ui.add_sized([CONTROL_HEIGHT, CONTROL_HEIGHT], egui::Button::new(RichText::new(icon).size(SIZE_ICON)))
+    })
+    .inner
+}
+
+/// The frame of a dialog.
+pub fn dialog_frame() -> egui::Frame {
+    egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, LINE_DARK)).corner_radius(radius()).inner_margin(egui::Margin::same(PADDING_I))
 }
 
 pub fn checkerboard(painter: &egui::Painter, r: Rect) {
@@ -86,9 +121,9 @@ pub fn setup_fonts(ctx: &egui::Context) {
 pub fn setup_style(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Light);
     ctx.style_mut_of(egui::Theme::Light, |s| {
-        s.spacing.item_spacing = Vec2::new(6.0, 6.0);
-        s.spacing.button_padding = Vec2::new(8.0, 4.0);
-        s.spacing.interact_size.y = 26.0;
+        s.spacing.item_spacing = Vec2::splat(GAP);
+        s.spacing.button_padding = Vec2::new(8.0, 2.0);
+        s.spacing.interact_size.y = CONTROL_HEIGHT;
         s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(SIZE_BODY));
         s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(SIZE_BODY));
         s.text_styles.insert(egui::TextStyle::Small, FontId::proportional(SIZE_SMALL));

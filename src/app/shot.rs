@@ -62,7 +62,7 @@ impl App {
             }
         }
         match scene.as_str() {
-            "advanced" => self.adv_default_open = true,
+            "advanced" => self.adv_open = true,
             "history" => self.right_tab = 1,
             "export" => self.export_open = true,
             "quit" => self.quit_open = true,

@@ -6,16 +6,12 @@ use kage::blend::{AI, MENU_ORDER, ORIGINAL, SHADOW};
 
 use super::App;
 use crate::i18n::Lang;
-use crate::theme::{primary_button, radius, BLUE, HOVER, LINE, LINE_DARK, MUTED, PANEL, SEL, SIZE_BODY, SIZE_ICON, SIZE_SMALL, SIZE_TITLE, SLOT, STATE_OFF, TEXT};
+use crate::theme::{primary_button, radius, ACTION_HEIGHT, BLUE, CONTROL_HEIGHT, GAP, HOVER, LINE, LINE_DARK, MUTED, PADDING_I, PANEL, SECTION_GAP, SEL, SIZE_BODY, SIZE_ICON, SIZE_SMALL, SIZE_TITLE, SLOT, STATE_OFF, TEXT, VALUE_WIDTH};
 
 const LAYER_ROW: f32 = 58.0;
 const HISTORY_ROW: f32 = 74.0;
 const LAYER_THUMB: f32 = 48.0;
-/// Space for the longest value in the property rows.
-const VALUE_WIDTH: f32 = 66.0;
-const PROP_LABEL_WIDTH: f32 = 64.0;
-const ACTION_HEIGHT: f32 = 48.0;
-const PROP_GAP: f32 = 10.0;
+const PROP_LABEL_WIDTH: f32 = 68.0;
 
 fn fit_thumb(painter: &egui::Painter, tex: TextureId, size: Vec2, slot: Rect, tint: Color32) {
     let k = (slot.width() / size.x).min(slot.height() / size.y);
@@ -28,8 +24,8 @@ impl App {
     pub(super) fn right_panel(&mut self, ui: &mut egui::Ui) {
         let t = self.t();
         // The end of the work, level with Generate on the other side.
-        let action = Frame::new().fill(PANEL).inner_margin(Margin { left: 0, right: 0, top: 10, bottom: 2 });
-        egui::Panel::bottom("export_action").frame(action).show(ui, |ui| {
+        let action = Frame::new().fill(PANEL).inner_margin(Margin { left: 0, right: 0, top: PADDING_I, bottom: 0 });
+        egui::Panel::bottom("export_action").frame(action).resizable(false).show(ui, |ui| {
             let has_result = self.current.is_some();
             let can_export = has_result && self.export_rx.is_none() && !self.export_pending;
             let main_action = has_result && !self.running() && self.unapplied(t).is_empty();
@@ -40,8 +36,9 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
+            let w = (ui.available_width() - GAP) / 2.0;
             for (i, label) in [t.tab_layers, t.history].into_iter().enumerate() {
-                if ui.add(egui::Button::new(label).selected(self.right_tab == i).min_size(Vec2::new(96.0, 26.0))).clicked() {
+                if ui.add_sized([w, CONTROL_HEIGHT], egui::Button::new(label).selected(self.right_tab == i)).clicked() {
                     self.right_tab = i;
                 }
             }
@@ -90,8 +87,8 @@ impl App {
         };
         let sel = if ids.contains(&self.selected_layer) { self.selected_layer } else { ids.first().copied().unwrap_or(ORIGINAL) };
 
-        let field = ui.available_width() - PROP_LABEL_WIDTH - PROP_GAP;
-        egui::Grid::new("layer_props").num_columns(2).spacing([PROP_GAP, 8.0]).min_col_width(PROP_LABEL_WIDTH).show(ui, |ui| {
+        let field = ui.available_width() - PROP_LABEL_WIDTH - SECTION_GAP;
+        egui::Grid::new("layer_props").num_columns(2).spacing([SECTION_GAP, GAP]).min_col_width(PROP_LABEL_WIDTH).show(ui, |ui| {
             ui.label(t.blend_title);
             ui.add_enabled_ui(has_result && sel == SHADOW, |ui| {
                 let text = if sel == SHADOW { t.blends[self.cfg.blend] } else { t.normal };
@@ -111,7 +108,7 @@ impl App {
                     ui.spacing_mut().slider_width = field - VALUE_WIDTH - ui.spacing().item_spacing.x;
                     ui.add(egui::Slider::new(&mut self.opacity[sel], 0.0..=1.0).show_value(false));
                     let mut percent = self.opacity[sel] * 100.0;
-                    if ui.add_sized([VALUE_WIDTH, 22.0], egui::DragValue::new(&mut percent).range(0.0..=100.0).speed(1.0).fixed_decimals(0).suffix("%")).changed() {
+                    if ui.add_sized([VALUE_WIDTH, CONTROL_HEIGHT], egui::DragValue::new(&mut percent).range(0.0..=100.0).speed(1.0).fixed_decimals(0).suffix("%")).changed() {
                         self.opacity[sel] = percent / 100.0;
                     }
                 });
@@ -126,8 +123,8 @@ impl App {
                 ui.horizontal(|ui| {
                     let (mut x, mut y) = moved;
                     let w = (field - ui.spacing().item_spacing.x) / 2.0;
-                    let dx = ui.add_sized([w, 22.0], egui::DragValue::new(&mut x).speed(1.0).prefix("X "));
-                    let dy = ui.add_sized([w, 22.0], egui::DragValue::new(&mut y).speed(1.0).prefix("Y "));
+                    let dx = ui.add_sized([w, CONTROL_HEIGHT], egui::DragValue::new(&mut x).speed(1.0).prefix("X "));
+                    let dy = ui.add_sized([w, CONTROL_HEIGHT], egui::DragValue::new(&mut y).speed(1.0).prefix("Y "));
                     if dx.changed() || dy.changed() {
                         self.move_shadow(x - moved.0, y - moved.1);
                     }
@@ -152,7 +149,7 @@ impl App {
             }
             let visible = self.visible[id];
             // Eye (registered after the row, so it gets its own clicks).
-            let eye_rect = Rect::from_min_size(Pos2::new(r.left() + 4.0, r.center().y - 14.0), Vec2::splat(28.0));
+            let eye_rect = Rect::from_min_size(Pos2::new(r.left() + GAP, r.center().y - CONTROL_HEIGHT / 2.0), Vec2::splat(CONTROL_HEIGHT));
             let eye_resp = ui.interact(eye_rect, Id::new(("eye", id)), Sense::click());
             ui.painter().rect_filled(eye_rect, radius(), if eye_resp.hovered() { HOVER } else { SLOT });
             ui.painter().rect_stroke(eye_rect, radius(), Stroke::new(1.0, LINE), StrokeKind::Inside);
@@ -185,13 +182,13 @@ impl App {
             };
             painter.text(Pos2::new(x, r.top() + 40.0), Align2::LEFT_CENTER, sub, FontId::proportional(SIZE_SMALL), MUTED);
             if id == ORIGINAL {
-                let lock = Pos2::new(r.right() - 16.0, r.center().y);
+                let lock = Pos2::new(r.right() - GAP - CONTROL_HEIGHT / 2.0, r.center().y);
                 painter.text(lock, Align2::CENTER_CENTER, ph::LOCK_SIMPLE, FontId::proportional(14.0), MUTED);
                 ui.interact(Rect::from_center_size(lock, Vec2::splat(18.0)), Id::new("lock"), Sense::hover()).on_hover_text(t.locked);
             }
             if id == SHADOW {
                 // Only the shadow can be moved; the original stays where it is.
-                let rect = Rect::from_min_size(Pos2::new(r.right() - 32.0, r.center().y - 14.0), Vec2::splat(28.0));
+                let rect = Rect::from_min_size(Pos2::new(r.right() - GAP - CONTROL_HEIGHT, r.center().y - CONTROL_HEIGHT / 2.0), Vec2::splat(CONTROL_HEIGHT));
                 let button = ui.interact(rect, Id::new("move_shadow"), Sense::click());
                 let (fill, icon_color) = match (self.move_mode, button.hovered()) {
                     (true, _) => (BLUE, Color32::WHITE),
@@ -228,7 +225,7 @@ impl App {
                 } else if resp.hovered() {
                     ui.painter().rect_filled(r, radius(), HOVER);
                 }
-                let slot = Rect::from_min_size(r.min + Vec2::new(4.0, 4.0), Vec2::new(37.0, 66.0));
+                let slot = Rect::from_min_size(r.min + Vec2::splat(GAP), Vec2::new(35.0, 62.0));
                 let ts = e.thumb.size_vec2();
                 let k = (slot.width() / ts.x).min(slot.height() / ts.y);
                 ui.painter().image(e.thumb.id(), Rect::from_center_size(slot.center(), ts * k), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
