@@ -104,12 +104,6 @@ pub fn model_path(dir: &Path, m: &ModelFile) -> PathBuf {
     dir.join(m.folder).join(m.file)
 }
 
-/// Which model a file is, by its name.
-pub fn index_of_file(path: &Path) -> Option<usize> {
-    let name = path.file_name()?.to_str()?;
-    MODELS.iter().position(|m| m.file.eq_ignore_ascii_case(name))
-}
-
 /// How many files are in `dir` with the right size (a quick look; the Verifier still checks the hashes).
 pub fn present_count(dir: &Path) -> usize {
     MODELS.iter().filter(|m| stat(&model_path(dir, m)).is_some_and(|(size, _)| size == m.size)).count()
@@ -307,32 +301,25 @@ impl Verifier {
     /// file that does not match), then place it as `dir/<folder>/<file>` - a hard link when on the same drive
     /// (no extra space, the original stays where it is), a copy otherwise.
     pub fn place(&self, i: usize, src: PathBuf, dir: PathBuf) {
-        self.place_many(vec![(i, src)], dir);
-    }
-
-    /// `place` for several files, one after the other.
-    pub fn place_many(&self, picks: Vec<(usize, PathBuf)>, dir: PathBuf) {
         let gen = self.generation.load(Ordering::SeqCst);
         self.state.lock().unwrap().running = true;
         let me = self.clone();
         std::thread::spawn(move || {
             let _guard = me.run_lock.lock().unwrap();
-            for (i, src) in picks {
-                if me.cancelled(gen) {
-                    return;
-                }
-                let before = {
-                    let mut s = me.state.lock().unwrap();
-                    s.notes[i] = None;
-                    s.status[i].clone()
-                };
-                match me.place_file(i, &src, &dir, gen) {
-                    Ok(()) => me.set(i, Status::Ok),
-                    Err(note) => {
-                        me.set(i, before);
-                        if let Some(note) = note {
-                            me.state.lock().unwrap().notes[i] = Some(note);
-                        }
+            if me.cancelled(gen) {
+                return;
+            }
+            let before = {
+                let mut s = me.state.lock().unwrap();
+                s.notes[i] = None;
+                s.status[i].clone()
+            };
+            match me.place_file(i, &src, &dir, gen) {
+                Ok(()) => me.set(i, Status::Ok),
+                Err(note) => {
+                    me.set(i, before);
+                    if let Some(note) = note {
+                        me.state.lock().unwrap().notes[i] = Some(note);
                     }
                 }
             }
@@ -460,8 +447,7 @@ impl Verifier {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_of_file, present_count, prepare_dir, MODELS, NOTE_FILE};
-    use std::path::Path;
+    use super::{present_count, prepare_dir, MODELS, NOTE_FILE};
 
     #[test]
     fn prepare_dir_makes_the_directories_and_keeps_a_note_that_exists() {
@@ -477,14 +463,5 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "edited");
         assert_eq!(present_count(&dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn files_are_recognized_by_name() {
-        for (i, m) in MODELS.iter().enumerate() {
-            assert_eq!(index_of_file(&Path::new(r"C:\Users\x\Downloads").join(m.file)), Some(i));
-        }
-        assert_eq!(index_of_file(Path::new("BIREFNET.SAFETENSORS")), Some(3));
-        assert_eq!(index_of_file(Path::new("other.safetensors")), None);
     }
 }

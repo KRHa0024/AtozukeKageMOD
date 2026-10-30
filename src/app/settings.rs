@@ -89,22 +89,6 @@ impl App {
         }
     }
 
-    /// Several downloaded files at once: sorted by name, each verified before it is used.
-    fn pick_model_files(&mut self, ctx: &egui::Context) {
-        let t = self.t();
-        let mut dialog = rfd::FileDialog::new().set_title(t.pick_many).add_filter("safetensors", &["safetensors"]);
-        if let Some(downloads) = std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("Downloads")) {
-            dialog = dialog.set_directory(downloads);
-        }
-        let Some(files) = dialog.pick_files() else { return };
-        let (known, unknown): (Vec<_>, Vec<_>) = files.into_iter().partition(|p| models::index_of_file(p).is_some());
-        if !unknown.is_empty() {
-            self.warn(ctx, &t.picked_unknown.replace("{}", &unknown.len().to_string()));
-        }
-        let picks = known.into_iter().filter_map(|p| Some((models::index_of_file(&p)?, p))).collect();
-        self.verifier.place_many(picks, PathBuf::from(self.cfg.model_dir.trim()));
-    }
-
     fn models_tab(&mut self, ui: &mut egui::Ui, t: &'static T) {
         let statuses = self.verifier.statuses();
         let notes = self.verifier.notes();
@@ -128,34 +112,26 @@ impl App {
                 }
             });
         });
-        ui.add(egui::Label::new(t.no_download).wrap());
+        ui.add(egui::Label::new(t.models_note).wrap());
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(t.model_folder);
-            let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.model_dir).desired_width(ui.available_width() - 130.0).font(egui::TextStyle::Monospace));
+            let r = ui.add(egui::TextEdit::singleline(&mut self.cfg.model_dir).desired_width(ui.available_width() - 62.0).font(egui::TextStyle::Monospace));
             if r.lost_focus() {
                 self.apply_dirs();
             }
-            if ui.button(t.browse).clicked() {
-                if let Some(dir) = rfd::FileDialog::new().set_directory(&self.cfg.model_dir).pick_folder() {
-                    self.cfg.model_dir = dir.display().to_string();
-                    self.apply_dirs();
-                }
-            }
             if ui.button(t.open).on_hover_text(t.open_folder_tip).clicked() {
                 let dir = PathBuf::from(self.cfg.model_dir.trim());
-                for m in &MODELS {
-                    let _ = std::fs::create_dir_all(dir.join(m.folder));
-                }
+                let _ = models::prepare_dir(&dir);
                 open_in_explorer(&dir);
             }
         });
-        ui.add_space(8.0);
-        let pick_many = egui::Button::new(format!("{}  {}", ph::FILE_ARROW_UP, t.pick_many));
-        if ui.add_enabled(!checking, pick_many).on_hover_text(t.pick_many_tip).clicked() {
-            self.pick_model_files(ui.ctx());
-        }
-        ui.add_space(8.0);
+        ui.add_space(12.0);
+        ui.label(RichText::new(t.layout_title).strong());
+        self.model_layout(ui);
+        ui.add_space(12.0);
+        ui.label(RichText::new(t.pick_title).strong());
+        ui.label(RichText::new(t.pick_note).color(MUTED));
         Frame::new().fill(egui::Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::same(6)).show(ui, |ui| {
             egui::Grid::new("models").num_columns(4).spacing([14.0, 8.0]).show(ui, |ui| {
                 for h in ["", t.col_file, t.col_hash, t.col_source] {
@@ -176,7 +152,7 @@ impl App {
                     ui.vertical(|ui| {
                         ui.add(egui::Label::new(t.purposes[i]).extend());
                         ui.add(egui::Label::new(RichText::new(m.file).monospace().color(MUTED)).extend());
-                        ui.add(egui::Label::new(RichText::new(format!("{}: {} · {:.2} GB", t.col_dir, m.folder, m.size as f64 / 1e9)).monospace().color(MUTED)).extend());
+                        ui.add(egui::Label::new(RichText::new(format!("{:.2} GB", m.size as f64 / 1e9)).monospace().color(MUTED)).extend());
                     });
                     let note = match &notes[i] {
                         Some(models::Note::PickedMismatch) => Some(t.picked_mismatch.to_string()),
@@ -208,6 +184,20 @@ impl App {
                     ui.end_row();
                 }
             });
+        });
+    }
+
+    /// The directory tree the models have to be in.
+    fn model_layout(&self, ui: &mut egui::Ui) {
+        let dir = Path::new(self.cfg.model_dir.trim());
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "models".into());
+        Frame::new().fill(egui::Color32::WHITE).stroke(Stroke::new(1.0, LINE)).inner_margin(Margin::same(8)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new(format!("{name}/")).monospace());
+            for (i, m) in MODELS.iter().enumerate() {
+                let branch = if i + 1 == MODELS.len() { "└─" } else { "├─" };
+                ui.label(RichText::new(format!("{branch} {}/{}", m.folder, m.file)).monospace());
+            }
         });
     }
 
