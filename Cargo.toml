@@ -1,6 +1,6 @@
 [package]
 name = "atozuke-kage-mod"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Atozuke Kage MOD: add AI shading to an image as a separate shadow layer"
 license = "MIT"
