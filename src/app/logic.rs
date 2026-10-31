@@ -209,6 +209,7 @@ impl App {
         self.tick_models(ctx, now);
         self.tick_resolve(ctx, now);
         self.tick_export(ctx, now);
+        self.tick_update(ctx);
         self.tick_config(now);
     }
 
@@ -504,7 +505,7 @@ impl App {
 
     pub(super) fn shortcuts(&mut self, ctx: &egui::Context) {
         self.peek_original = false;
-        if ctx.egui_wants_keyboard_input() || self.export_open || self.quit_open {
+        if ctx.egui_wants_keyboard_input() || self.export_open || self.quit_open || self.update.dialog.is_some() {
             return;
         }
         let pressed = |key: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, key)));

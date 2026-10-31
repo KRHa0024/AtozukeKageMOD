@@ -8,6 +8,7 @@ mod panel;
 mod settings;
 mod shot;
 mod status;
+mod update;
 mod views;
 
 use std::path::{Path, PathBuf};
@@ -166,6 +167,7 @@ pub struct App {
     view_tools_width: f32,
     /// The wheel does not zoom until this time: it rests at actual pixels.
     wheel_held_until: f64,
+    update: update::Update,
     shot: Option<Shot>,
 }
 
@@ -189,6 +191,9 @@ impl App {
         let comfy = Comfy::new(&data, log.clone());
         verifier.start(PathBuf::from(&cfg.model_dir));
         comfy.start(&cfg.comfy_dir, Path::new(&cfg.model_dir));
+        if let Ok(exe) = std::env::current_exe() {
+            std::thread::spawn(move || kage::update::clean_up(&exe));
+        }
         let lang = if cfg.lang == "en" { Lang::En } else { Lang::Ja };
         Self {
             lang,
@@ -253,9 +258,16 @@ impl App {
             adv_open: false,
             view_tools_width: 0.0,
             wheel_held_until: 0.0,
+            update: update::Update::default(),
             shot: None,
         }
         .with_scene(&cc.egui_ctx)
+        .with_update_check(&cc.egui_ctx)
+    }
+
+    fn with_update_check(mut self, ctx: &egui::Context) -> Self {
+        self.check_for_update(ctx);
+        self
     }
 
     fn t(&self) -> &'static T {
@@ -341,6 +353,9 @@ impl eframe::App for App {
         if self.quit_open {
             self.quit_modal(&ctx);
         }
+        if self.update.dialog.is_some() {
+            self.update_modal(&ctx);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -349,5 +364,6 @@ impl eframe::App for App {
         self.cfg.window = self.window_size.or(self.cfg.window);
         self.save_config();
         self.comfy.stop();
+        self.restart_after_update();
     }
 }

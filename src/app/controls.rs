@@ -64,6 +64,7 @@ impl App {
                         self.settings_tab = tab;
                     }
                 }
+                self.update_notice(ui, t);
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     if let Some(img) = &self.image {
                         ui.add_space(SECTION_GAP);

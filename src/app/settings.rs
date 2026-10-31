@@ -71,6 +71,15 @@ fn model_columns(
     });
 }
 
+/// Muted text under a checkbox's own text.
+fn checkbox_note(ui: &mut egui::Ui, text: &str) {
+    let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+    Frame::new().inner_margin(Margin { left: indent as i8, ..Margin::ZERO }).show(ui, |ui| {
+        ui.set_max_width(TEXT_WIDTH);
+        ui.add(egui::Label::new(RichText::new(text).color(MUTED)).wrap());
+    });
+}
+
 /// A directory or file in Explorer, or a URL in the browser.
 pub(super) fn open_in_explorer(target: &Path) {
     let text = target.to_string_lossy();
@@ -336,12 +345,13 @@ impl App {
         ui.separator();
         ui.label(RichText::new(t.gpu_memory).strong());
         ui.checkbox(&mut self.cfg.keep_loaded, t.keep_loaded);
-        // Under the checkbox's text.
-        let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
-        Frame::new().inner_margin(Margin { left: indent as i8, ..Margin::ZERO }).show(ui, |ui| {
-            ui.set_max_width(TEXT_WIDTH);
-            ui.add(egui::Label::new(RichText::new(t.keep_loaded_desc).color(MUTED)).wrap());
-        });
+        checkbox_note(ui, t.keep_loaded_desc);
+        ui.add_space(SECTION_GAP);
+        ui.separator();
+        ui.label(RichText::new(t.update).strong());
+        ui.checkbox(&mut self.cfg.check_updates, t.update_check);
+        checkbox_note(ui, t.update_check_desc);
+        checkbox_note(ui, &t.update_current.replace("{}", kage::update::CURRENT));
         ui.add_space(SECTION_GAP);
         ui.separator();
         ui.label(RichText::new(t.display_section).strong());

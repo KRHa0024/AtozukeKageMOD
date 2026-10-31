@@ -37,6 +37,8 @@ pub struct Config {
     pub blend: usize,
     /// Canvas surround: 0 light, 1 mid gray, 2 dark.
     pub canvas_shade: usize,
+    /// Ask GitHub for a newer release at start.
+    pub check_updates: bool,
     /// Inner window size in points.
     pub window: Option<[f32; 2]>,
 }
@@ -61,6 +63,7 @@ impl Default for Config {
             out_dir: default_out_dir().display().to_string(),
             blend: DEFAULT_MODE,
             canvas_shade: 0,
+            check_updates: true,
             window: None,
         }
     }

@@ -1,12 +1,15 @@
 //! Self-screenshot for checking the layout: renders a scene, saves a PNG and exits.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use eframe::egui;
 use kage::blend::{AI, SHADOW};
 use kage::shading::Image8;
+use kage::update::Release;
 
+use super::update::Dialog;
 use super::{App, Phase, Screen, MODELS_TAB};
 use crate::i18n::Lang;
 
@@ -79,6 +82,20 @@ impl App {
             "history" => self.right_tab = 1,
             "export" => self.export_open = true,
             "quit" => self.quit_open = true,
+            "update_notice" | "update_confirm" | "update_progress" | "update_failed" => {
+                self.update.release = Some(Release { version: "0.1.5".into(), url: String::new(), size: 4_440_000, sha256: String::new() });
+                self.update.dialog = match scene.as_str() {
+                    "update_confirm" => Some(Dialog::Confirm),
+                    "update_progress" => {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        // Nothing ever arrives: the dialog stays as it is for the shot.
+                        std::mem::forget(tx);
+                        Some(Dialog::Download { rx, progress: Arc::new(AtomicU64::new(2_100_000)), cancel: Arc::new(AtomicBool::new(false)) })
+                    }
+                    "update_failed" => Some(Dialog::Failed { message: self.t().update_errors[0], detail: "connection refused".into() }),
+                    _ => None,
+                };
+            }
             "settings_models" => {
                 self.screen = Screen::Settings;
                 self.settings_tab = MODELS_TAB;
@@ -113,6 +130,9 @@ impl App {
         ctx.request_repaint();
         if shot.wheel.is_some() {
             shot.zoom_trace += &format!("{} {:.3} {:.4}\n", shot.frame, ctx.input(|i| i.time), self.scale * ctx.pixels_per_point());
+        }
+        if shot.auto.as_deref() == Some("update") && self.update.release.is_some() && self.update.dialog.is_none() && self.update.restart.is_none() {
+            self.start_update(ctx);
         }
         let mut start: Option<String> = None;
         let mut export = false;
