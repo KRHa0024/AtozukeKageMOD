@@ -164,6 +164,8 @@ pub struct App {
     adv_open: bool,
     /// Width of the compare and zoom row in the last frame, for centering it.
     view_tools_width: f32,
+    /// The wheel does not zoom until this time: it rests at actual pixels.
+    wheel_held_until: f64,
     shot: Option<Shot>,
 }
 
@@ -250,6 +252,7 @@ impl App {
             log_seen: 0,
             adv_open: false,
             view_tools_width: 0.0,
+            wheel_held_until: 0.0,
             shot: None,
         }
         .with_scene(&cc.egui_ctx)
@@ -292,6 +295,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.shot_input(raw_input);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let dropped: Vec<_> =

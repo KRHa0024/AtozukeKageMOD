@@ -10,9 +10,17 @@ use kage::shading::Image8;
 use super::{App, Phase, Screen, MODELS_TAB};
 use crate::i18n::Lang;
 
+/// One wheel notch every this many frames.
+const WHEEL_EVERY: u32 = 20;
+/// On the canvas at any window size.
+const WHEEL_POINTER: egui::Pos2 = egui::pos2(480.0, 320.0);
+
 pub(super) struct Shot {
     out: PathBuf,
     frame: u32,
+    /// Lines of a wheel notch sent over the canvas; the zoom per frame goes to `<out>.zoom.txt`.
+    wheel: Option<f32>,
+    zoom_trace: String,
     /// Take the shot at this frame, whatever is going on: shows work in progress.
     at_frame: Option<u32>,
     /// Waiting for a run to finish before taking the shot.
@@ -43,6 +51,8 @@ impl App {
         self.shot = Some(Shot {
             out: out.into(),
             frame: 0,
+            wheel: std::env::var("KAGE_WHEEL").ok().and_then(|v| v.parse().ok()),
+            zoom_trace: String::new(),
             at_frame: std::env::var("KAGE_SHOT_FRAME").ok().and_then(|v| v.parse().ok()),
             auto: std::env::var("KAGE_AUTO").ok(),
             started: false,
@@ -83,10 +93,27 @@ impl App {
         self
     }
 
+    /// Wheel notches as the window sends them, so the real scroll smoothing runs too.
+    pub(super) fn shot_input(&self, raw: &mut egui::RawInput) {
+        let Some((shot, lines)) = self.shot.as_ref().and_then(|shot| Some((shot, shot.wheel?))) else { return };
+        raw.events.push(egui::Event::PointerMoved(WHEEL_POINTER));
+        if shot.frame.is_multiple_of(WHEEL_EVERY) {
+            raw.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, lines),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
+
     pub(super) fn handle_shot(&mut self, ctx: &egui::Context) {
         let Some(mut shot) = self.shot.take() else { return };
         shot.frame += 1;
         ctx.request_repaint();
+        if shot.wheel.is_some() {
+            shot.zoom_trace += &format!("{} {:.3} {:.4}\n", shot.frame, ctx.input(|i| i.time), self.scale * ctx.pixels_per_point());
+        }
         let mut start: Option<String> = None;
         let mut export = false;
         let take = match &shot.auto {
@@ -143,6 +170,9 @@ impl App {
                 let [w, h] = image.size;
                 if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, image.as_raw().to_vec()) {
                     let _ = buf.save(&shot.out);
+                }
+                if shot.wheel.is_some() {
+                    let _ = std::fs::write(shot.out.with_extension("zoom.txt"), &shot.zoom_trace);
                 }
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }

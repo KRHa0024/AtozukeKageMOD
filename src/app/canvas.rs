@@ -26,9 +26,22 @@ const FIT_MARGIN: f32 = 48.0;
 const NEAREST_FROM: f32 = 2.0;
 /// Wheel zoom stops at actual pixels when it comes this close.
 const ACTUAL_SNAP: f32 = 0.03;
+/// Closer than this it is at actual pixels, whatever the rounding of 1 / pixels-per-point.
+const AT_ACTUAL: f32 = 0.001;
+/// How long the wheel rests there: the rest of the notch still arrives as smooth scrolling and would run past it.
+const ACTUAL_HOLD: f64 = 0.25;
 
 fn snap_to_device(p: Pos2, ppp: f32) -> Pos2 {
     Pos2::new((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp)
+}
+
+/// Whether a wheel step between two zooms (device pixels per image pixel) stops at actual pixels: on the way there
+/// only, so the wheel can always leave again.
+fn stops_at_actual(from: f32, to: f32) -> bool {
+    let (from, to) = (from - 1.0, to - 1.0);
+    let arriving = to.abs() < from.abs() && to.abs() < ACTUAL_SNAP;
+    let crossing = from * to < 0.0;
+    from.abs() >= AT_ACTUAL && (arriving || crossing)
 }
 
 impl App {
@@ -114,11 +127,12 @@ impl App {
             }
         }
         if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
+            let (scroll, now) = ui.input(|i| (i.smooth_scroll_delta.y, i.time));
+            if scroll != 0.0 && now >= self.wheel_held_until {
                 let mut new_scale = (scale * (1.0 + scroll * 0.0015)).clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
-                if (new_scale * ppp - 1.0).abs() < ACTUAL_SNAP {
+                if stops_at_actual(scale * ppp, new_scale * ppp) {
                     new_scale = 1.0 / ppp;
+                    self.wheel_held_until = now + ACTUAL_HOLD;
                 }
                 if let Some(pointer) = resp.hover_pos() {
                     let anchor = pointer - (rect.center() + self.pan);
@@ -344,4 +358,58 @@ fn side_label(painter: &egui::Painter, pos: Pos2, align: Align2, text: &str) {
     painter.rect_filled(rect, radius(), PANEL);
     painter.rect_stroke(rect, radius(), Stroke::new(1.0, LINE_DARK), StrokeKind::Inside);
     painter.galley(rect.min + Vec2::new(5.0, 2.0), galley, TEXT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scrolls in small steps like smooth scrolling does, resting at actual pixels as the canvas does.
+    fn scroll(mut zoom: f32, step: f32, frames: usize, ppp: f32) -> (f32, usize) {
+        let mut stops = 0;
+        for _ in 0..frames {
+            let next = zoom * step;
+            if stops_at_actual(zoom, next) {
+                stops += 1;
+                // What the canvas stores: the scale, not the zoom, so the rounding of the division stays in.
+                zoom = 1.0 / ppp * ppp;
+            } else {
+                zoom = next;
+            }
+        }
+        (zoom, stops)
+    }
+
+    #[test]
+    fn the_wheel_stops_at_actual_pixels_once_from_either_side() {
+        for ppp in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let (zoom, stops) = scroll(0.5, 1.008, 200, ppp);
+            assert_eq!(stops, 1, "in, ppp {ppp}");
+            assert!(zoom > 1.2, "in, ppp {ppp}: {zoom}");
+            let (zoom, stops) = scroll(2.0, 1.0 / 1.008, 200, ppp);
+            assert_eq!(stops, 1, "out, ppp {ppp}");
+            assert!(zoom < 0.8, "out, ppp {ppp}: {zoom}");
+        }
+    }
+
+    #[test]
+    fn the_wheel_leaves_actual_pixels_in_both_directions() {
+        for ppp in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let actual = 1.0 / ppp * ppp;
+            assert!(!stops_at_actual(actual, actual * 1.008), "in, ppp {ppp}");
+            assert!(!stops_at_actual(actual, actual / 1.008), "out, ppp {ppp}");
+        }
+    }
+
+    #[test]
+    fn a_big_step_across_actual_pixels_stops_there_too() {
+        assert!(stops_at_actual(0.9, 1.1));
+        assert!(stops_at_actual(1.1, 0.9));
+    }
+
+    #[test]
+    fn moving_away_near_actual_pixels_does_not_pull_back() {
+        assert!(!stops_at_actual(1.01, 1.02));
+        assert!(!stops_at_actual(0.99, 0.98));
+    }
 }
