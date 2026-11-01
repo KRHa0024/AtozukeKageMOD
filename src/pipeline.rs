@@ -19,7 +19,7 @@ use crate::models::{Verifier, MODELS};
 use crate::resample::{self, Filter};
 use crate::shading::{self, Image8, Layers, Options};
 
-/// Tuned on VRChat / anime renders: asking for "natural, only darken" made the model grade the whole image (pink
+/// Tuned on 3D avatar / anime renders: asking for "natural, only darken" made the model grade the whole image (pink
 /// hair turned brown); illustration-style shading keeps colors and gives defined shadow shapes.
 const SHADE_PROMPT: &str = "Add strong, beautiful anime-style shading to the characters, like a professionally shaded illustration{light}: crisp shadow shapes under the bangs and on the neck, under the chin, on the inner sides of the arms and legs, in clothing folds and where parts overlap, with soft gradients on the turned-away side. Highlights and lit areas stay exactly as in the original. Keep all colors, the face, every detail, the background and the framing exactly the same; only add shadows.";
 /// Sources larger than this are shaded at a higher model resolution (finer shadow shapes for 4K renders).
